@@ -1,0 +1,27 @@
+{
+  "id": "dom-probe",
+  "name": "DOM 探针（开发用）",
+  "version": "0.2.0",
+  "description": "把 Claude 页面的结构和原生控件的样式存成文件，用来给拓展的挂载点定锚点。不记录对话内容。",
+  "engines": {
+    "codexpp": 1
+  },
+  "backend": {
+    "script": "backend.mjs"
+  },
+  "claudeDesktop": {
+    "renderer": "probe.js",
+    "methods": [
+      "save",
+      "list"
+    ]
+  },
+  "config": {
+    "autoTour": {
+      "type": "boolean",
+      "default": false,
+      "title": "启动后自动巡览",
+      "description": "Claude 页面加载后自动依次打开 Chat、Cowork、Code、设置，各存一份（每个窗口只跑一次）"
+    }
+  }
+}

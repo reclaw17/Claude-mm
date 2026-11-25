@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { claudeState, emptyProfile, formatWindow, hostOf, normalizeModels, profileProblem, setupSteps, type ClaudeStatus } from "./model.ts";
+import { SECRET_MASK, claudeState, compareVersions, configInputText, configValues, emptyProfile, extensionRuntimeNote, formatWindow, hostOf, localizedText, normalizeModels, parseConfigInput, profileProblem, setupSteps, templateLabel, type ClaudeStatus, type ExtensionConfigField, type ExtensionInfo } from "./model.ts";
 
 const status = (patch: Partial<ClaudeStatus> = {}): ClaudeStatus => ({
   supported: true, sourceApp: "", version: "1.0", claudeRunning: false, running: false, connected: false,
-  caReady: true, caTrusted: true, nodeAvailable: true, dictationReady: true, models: [], needsRestart: false,
+  caReady: true, caTrusted: true, caMachineSupported: true, caMachineTrusted: false, nodeAvailable: true, dictationReady: true, models: [], needsRestart: false,
   config: { enabled: true, model: "", localization: true, voiceInput: false, computerUse: false, backgroundMode: false },
   ...patch,
 });
@@ -38,6 +38,10 @@ test("启动前清单按顺序列出缺的步骤", () => {
   const ready = { ...emptyProfile(), baseUrl: "https://a.example", model: "m" };
   assert.deepEqual(setupSteps(status(), ready), []);
   assert.deepEqual(setupSteps(status({ caTrusted: false, nodeAvailable: false }), null).map((step) => step.id), ["upstream", "node", "trust"]);
+  // 没认出 Claude 时缺 Node 的提示也要在（#46）。
+  assert.deepEqual(setupSteps(status({ supported: false, nodeAvailable: false }), ready).map((step) => step.id), ["node"]);
+  // 第三方模式不经代理：不要求信任证书。
+  assert.deepEqual(setupSteps(status({ caTrusted: false, config: { ...status().config, threePMode: true } }), null).map((step) => step.id), ["upstream"]);
 });
 
 test("窗口显示", () => {
@@ -54,4 +58,67 @@ test("前端调用的命令都在后端注册了", () => {
   const called = new Set([...app.matchAll(/"(claude_(?:mom|local)_[a-z_]+)"/g)].map((match) => match[1]));
   assert.ok(called.size >= 9, [...called].join(","));
   for (const command of called) assert.ok(new RegExp(`::${command},`).test(lib), `${command} 没有注册`);
+});
+
+test("recorded template versions are labelled by build date and id", () => {
+  const label = templateLabel({ build: "a4ced7f85b", builtAt: 1794603257 });
+  assert.match(label, /^2026-11-1[34] · a4ced7f85b$/);
+  assert.equal(templateLabel({ build: "x1", builtAt: null }), "x1");
+});
+
+test("扩展版本按语义化版本比较", () => {
+  const ordered = ["0.9.10", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "1.10.0", "2.0.0"];
+  for (let index = 1; index < ordered.length; index++) {
+    assert.equal(compareVersions(ordered[index], ordered[index - 1]), 1, `${ordered[index]} > ${ordered[index - 1]}`);
+    assert.equal(compareVersions(ordered[index - 1], ordered[index]), -1);
+  }
+  assert.equal(compareVersions("1.0.0+build.5", "1.0.0"), 0);
+  assert.equal(compareVersions("abc", "1.0.0"), 0);
+});
+
+const field = (extra: Partial<ExtensionConfigField>): ExtensionConfigField => ({
+  key: "x", type: "string", title: "X", description: "", default: "", options: [], secret: false, ...extra,
+});
+
+test("extension config inputs round-trip through text and say what is wrong", () => {
+  assert.equal(localizedText({ en: "Minutes", zh: "分钟" }), "分钟");
+  assert.equal(localizedText({ en: "Minutes" }), "Minutes");
+  assert.equal(localizedText("T"), "T");
+  assert.equal(localizedText(null), "");
+
+  const number = field({ type: "number", title: { zh: "分钟" }, min: 1, max: 60 });
+  assert.deepEqual(parseConfigInput(number, configInputText(number, 25)), { value: 25 });
+  assert.deepEqual(parseConfigInput(number, ""), { error: "「分钟」要填数字" });
+  assert.deepEqual(parseConfigInput(number, "0"), { error: "「分钟」不能小于 1" });
+  assert.deepEqual(parseConfigInput(number, "61"), { error: "「分钟」不能大于 60" });
+  assert.deepEqual(parseConfigInput(field({ type: "boolean" }), "true"), { value: true });
+  const select = field({ type: "select", options: [{ value: 1, label: "一" }, { value: "b", label: "B" }] });
+  assert.deepEqual(parseConfigInput(select, "1"), { value: 1 }, "选项的值保留原来的类型");
+  assert.ok("error" in parseConfigInput(select, "c"));
+  const list = field({ type: "array" });
+  assert.equal(configInputText(list, undefined), "[]");
+  assert.deepEqual(parseConfigInput(list, configInputText(list, ["a", "b"])), { value: ["a", "b"] });
+  assert.ok("error" in parseConfigInput(list, "{}"));
+  assert.ok("error" in parseConfigInput(field({ type: "object" }), "[1]"));
+  assert.ok("error" in parseConfigInput(field({ type: "object" }), "{bad"));
+
+  const schema = [number, field({ key: "token", secret: true }), field({ key: "untouched" })];
+  assert.deepEqual(configValues(schema, { x: "5", token: SECRET_MASK }), { values: { x: 5, token: SECRET_MASK } });
+  assert.deepEqual(configValues(schema, { x: "abc", token: "" }), { error: "「分钟」要填数字" });
+});
+
+test("the extension row says how a codexpp package is doing in the Claude page", () => {
+  const item = (extra: Partial<ExtensionInfo>): ExtensionInfo => ({
+    id: "demo", name: "Demo", version: "1.0.0", author: "", description: "", builtin: false, enabled: true, error: null,
+    format: "codexpp", capabilities: ["page"], notes: [], configSchema: [], config: {}, runtime: null, ...extra,
+  });
+  const runtime = (extra: object) => ({ status: "loaded" as const, error: "", unsupported: [], loadedAt: "", ...extra });
+  assert.equal(extensionRuntimeNote(item({ format: "manifest" })), null);
+  assert.equal(extensionRuntimeNote(item({ enabled: false })), null);
+  assert.equal(extensionRuntimeNote(item({ error: "bad" })), null);
+  assert.equal(extensionRuntimeNote(item({}))?.tone, "muted");
+  assert.deepEqual(extensionRuntimeNote(item({ runtime: runtime({}) })), { tone: "ok", text: "已加载" });
+  assert.deepEqual(extensionRuntimeNote(item({ runtime: runtime({ status: "failed", error: "SyntaxError: x\n    at y" }) })), { tone: "error", text: "加载失败：SyntaxError: x" });
+  assert.deepEqual(extensionRuntimeNote(item({ runtime: runtime({ error: "page: boom" }) })), { tone: "error", text: "已加载，运行中出错：page: boom" });
+  assert.match(extensionRuntimeNote(item({ runtime: runtime({ unsupported: ["registerComposerAction"] }) }))!.text, /registerComposerAction/);
 });

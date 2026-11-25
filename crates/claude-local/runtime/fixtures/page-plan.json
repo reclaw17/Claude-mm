@@ -1,0 +1,58 @@
+{
+  "legacy": [],
+  "packages": [
+    {
+      "backend": "<ROOT>/extensions/demo/backend.mjs",
+      "config": {
+        "minutes": 5,
+        "token": "sk-fixture"
+      },
+      "dataDir": "<ROOT>/extension-data/demo",
+      "hosted": false,
+      "id": "demo",
+      "key": "local:demo",
+      "methods": [
+        "status",
+        "config",
+        "fail",
+        "tick"
+      ],
+      "name": "Demo",
+      "pieces": [
+        {
+          "text": "// 一个 codexpp.json 拓展包在 Claude 页面里的包装（模板，由 src/extensions/plan.rs 填好再下发）。\n// 每个包单独一段脚本：语法错误只坏它自己。运行时（page-runtime.js）没起来时什么都不做，不影响 Claude 页面。\n(() => {\n  if (window.top !== window) return;\n  const runtime = window.__codexPlusUserScripts;\n  if (!runtime || typeof runtime.beginPackage !== \"function\") return;\n  const meta = {\"key\":\"local:demo\",\"manifest\":{\"claudeDesktop\":{\"backend\":true,\"methods\":[\"status\",\"config\",\"fail\",\"tick\"]},\"config\":{\"minutes\":5,\"token\":null},\"description\":\"Fixture\",\"engines\":{\"codexpp\":1},\"id\":\"demo\",\"name\":\"Demo\",\"permissions\":{\"routes\":[\"/backend/status\",\"/usage/history\"]},\"version\":\"1.0.0\"},\"name\":\"Demo\",\"source\":\"local\"};\n  // 同一页面只跑一次（补丁副本会在已加载的页面上补跑）。\n  if (!runtime.beginPackage(meta)) return;\n  try {\n    runtime.addStyle(meta.key, \"css/a.css\", "
+        },
+        {
+          "file": "css/a.css",
+          "json": true
+        },
+        {
+          "text": ");\n\n"
+        },
+        {
+          "file": "main.js"
+        },
+        {
+          "text": "\n;\n\n    runtime.endPackage(meta.key);\n  } catch (error) {\n    runtime.endPackage(meta.key, error);\n  }\n})();\n"
+        }
+      ],
+      "root": "<ROOT>/extensions/demo",
+      "routes": [
+        "/backend/status",
+        "/usage/history"
+      ],
+      "slug": "l-demo",
+      "version": "1.0.0"
+    }
+  ],
+  "runtime": {
+    "key": "runtime",
+    "pieces": [
+      {
+        "text": "window.__codexPlusClaudeBoot = {\"api\":\"/__codex_plus/api/v1/\",\"apiVersion\":1,\"host\":\"claudeDesktop\",\"packages\":[{\"key\":\"local:demo\",\"name\":\"Demo\",\"slug\":\"l-demo\"}],\"token\":\"__CODEXPP_PAGE_TOKEN__\",\"transport\":\"http\",\"version\":1};\n<RUNTIME>"
+      }
+    ]
+  },
+  "transport": "http",
+  "version": 1
+}

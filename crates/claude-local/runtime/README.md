@@ -30,7 +30,13 @@ official frontend to the Chinese catalog — Claude.app itself is never rewritte
 | `CLAUDE_LOCAL_STATE_FILE` | session and notification settings file; written atomically, mode `0600` |
 | `CLAUDE_LOCAL_READY_FILE` / `_INSTANCE_ID` | ready receipt and instance identity of the current launch |
 | `CLAUDE_LOCAL_LOCALIZATION` / `_VOICE_INPUT` / `_COMPUTER_USE` / `_BACKGROUND_MODE` / `_FORCE_BACKGROUND_MODE` | independent toggles per capability, `0` off, `1` on; the last one ignores the macOS version cap on background mode |
+| `CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR` / `_EXTENSIONS_DIR` / `_EXTENSIONS_STATE` | page extensions: the built-in and the user's extension directories (`<id>/manifest.json`), and the state file recording which ones are enabled (`{"enabled":[...]}`). Enabled extensions are inserted into the page shell, before the official scripts, as `/__codex_plus/ext/<id>/<file>` according to their manifest, read from disk on every request |
+| `CLAUDE_LOCAL_PAGE_PLAN` / `_PAGE_STATUS` | Codex++ extension packs (`<id>/codexpp.json`): the injection plan written by the host (`page-plan.json`; only a file readable by its owner alone is accepted), and the file the page writes with each pack's load result. See "Extension packs and the page API" below |
+| `CLAUDE_LOCAL_EXT_HOST_RECEIPT` | credentials file of an external host (`{"port", "token"}`). When set, no extension backend is started locally and the page's backend calls are forwarded to it; Codex++ uses it so that the page and Code sessions share one backend instance |
 | `CLAUDE_LOCAL_COWORK` | master switch for Cowork (GrowthBook `yukon_silver`), on by default; at `0` Claude's own value from the recorded template is used |
+| `CLAUDE_LOCAL_COWORK_PROMPT_FILE` | file that overrides the Cowork system prompt; when not set it is read from the local `app.asar`, with a built-in fallback when that fails |
+| `CLAUDE_LOCAL_TEMPLATE` | which recorded version the recorded UI uses (the name of a `mock/<build>/` directory, i.e. the frontend build id); when not set, or when that version has been retired, the newest one is used (by the page shell's `data-build-timestamp`) |
+| `CLAUDE_LOCAL_HUB_HOME` | only `1` is honored: use Claude's merged home page (GrowthBook `claude_ai_hub_web_delivery`, with chats and Cowork in one input box). When not set, the classic home page with the "Chats \| Cowork" switch is used: the flag is turned off and its code is removed from `gated_imports`. The "Merged home page" setting is on by default, and `1` is passed when the local service starts |
 
 Managed launch supports `--port 0`: after binding it writes a
 `{instanceId,pid,port,mode,lastClientAt}` receipt — no gateway credentials inside.
@@ -186,6 +192,7 @@ depends on local API data and static assets.
 
 ```
 GET  /api/bootstrap
+GET  /api/bootstrap/:org/system_prompts   (Cowork system prompt; read from the local app.asar first)
 GET  /api/account
 GET  /api/organizations
 GET  /api/organizations/:org
@@ -406,9 +413,9 @@ Fix: delete the `.claude.ai` `lastActiveOrg` cookie in
   .bak-claude-local.
 - Managed settings: `GET /api/claude_code/settings` →
   `{uuid,settings:{},checksum:"local-1"}` + ETag;
-  `policy_limits` → `{restrictions:[],compliance_taints:[],defaults:{},artifact_create_notice:null}`
-  (schema from index.chunk-BMmeHQk-/BymwSUZ2). Both the claude.ai and the 8899 direct paths
-  must be mocked.
+  `policy_limits` → `{restrictions:{},compliance_taints:[],defaults:{},artifact_create_notice:null}`
+  (the policy-limits validator in app.asar requires `restrictions` to be a non-null object, not an
+  array). Both the claude.ai and the 8899 direct paths must be mocked.
 - `count_tokens` is estimated locally; `/v1/models` is mocked; `/v1/messages` forwards to
   the local gateway.
 
@@ -533,3 +540,132 @@ remain unchanged. The user's `chicagoPreferredMode` is not modified — the curr
 background option changed from disabled to selectable, with "background" shown as selected;
 accessibility and screen recording still show as granted. No actual background operation
 was performed through this check.
+
+## Recorded versions (mock-templates/)
+
+The recorded UI's data is kept in one directory per frontend version: `mock-templates/<build>/` holds
+the sanitized `bootstrap.json`, `api/*.json` and the page shell `shell.html` from the same recording.
+The directory name must equal the frontend build id (the tests check this). `build.rs` embeds every
+directory into the program and installs them to `<state>/claude-local/mock/<build>/`; the user picks
+one in Settings → Interface → Version, the newest by default. Frontend code (JS/CSS etc.) is not
+bundled: the local service downloads and caches it from `assets-proxy.anthropic.com` when it is used.
+
+Adding a new version (needs an account that can log in to claude.ai; one recording serves every user):
+
+1. `open -na "Google Chrome" --args --user-data-dir=<temp dir> --remote-debugging-port=9447 https://claude.ai/login`, and log in.
+2. `node scripts/record-template.mjs --cdp http://127.0.0.1:9447 --out <private dir>`
+3. `node sanitize-mock.mjs <private dir>/mock` → written to `mock-templates/<build>/`
+4. Check that no personal information is left (`cargo test -p claude-local embedded_mock_template_is_sanitized`
+   checks emails; manually check the account uuid and the organization names as well), test it for real,
+   then commit. Delete the recording directory and the temporary Chrome profile when done.
+
+Older versions are kept; when one is too old or no longer works, just delete its directory.
+
+## Extension packs and the page API
+
+Besides page extensions (`manifest.json`), `extensions/` can also hold Codex++ extension packs
+(`codexpp.json`). A folder that contains a `codexpp.json` is treated as an extension pack, and the
+old-style injection skips it. The part of an extension pack that lives in the Claude page is described
+in the manifest's `claudeDesktop` block:
+
+| Field | Meaning |
+| --- | --- |
+| `claudeDesktop.renderer` | scripts injected into the page (`.js`, a string or an array), concatenated in order and executed in the same scope |
+| `claudeDesktop.styles` | styles (an array of `.css`) |
+| `claudeDesktop.methods` | backend methods the page can call; the backend is the manifest's `backend.script` |
+
+Manifest rules live only in Rust (`src/extensions/codexpp.rs`); the local service does not parse
+manifests: the host renders the enabled packs into an injection plan (`src/extensions/plan.rs`), and
+the local service only reads files and concatenates them.
+
+### What the page gets
+
+- `/__codex_plus/rt/runtime.js`: the page runtime (`page-runtime.js`), which provides `window.codexPlus`
+  with member names matching Codex++'s interface (the contract list is `page-api.json`).
+  `codexPlus.host` is `"claudeDesktop"`, and `codexPlus.supports(name)` tells whether a given mount
+  point is available here.
+- `/__codex_plus/pkg/<slug>.js`: one script per extension pack, wrapped by `page-wrap.js`. A syntax
+  error or exception in one pack affects only that pack.
+- Both are inserted with `defer` before the official scripts and answer same-origin requests only
+  (`Sec-Fetch-Site: same-origin`).
+
+### Mount points
+
+UI items registered by an extension are drawn onto the Claude page by the runtime. The ones that do
+not depend on Claude's DOM (notifications, confirm dialogs, full pages, floating tabs, shortcuts,
+themes, the `overlay` slot) work on any page; the rest are attached to Claude's own DOM, with the
+positions listed in the anchor table `page-anchors.js`:
+
+| API | Where it is attached |
+| --- | --- |
+| `registerPage` / `registerNavEntry` | after the sidebar's "Projects / Artifacts / Plugins" group of navigation rows; falls back to the floating button in the bottom-right corner when not found |
+| `registerComposerAction` | at the left of the input box's tool row, next to the plus button |
+| `registerCommand` / `registerInputTrigger` | input box: Enter intercepts "/name args"; suggestions pop up when the character before the cursor is a trigger |
+| `registerMessageAction` / `registerMessageDecoration` | in each message's action row (before the timestamp); between the reply body and the action row, under the user's message bubble |
+| `registerSlot` | `composer.above` / `composer.below`, `thread.top` / `thread.bottom`, `turn.after`, `sidebar.top` / `sidebar.bottom`, `titlebar`, `sessionRow.suffix`, `overlay` |
+| `registerRowAction` | next to "More options" on each row of the recent conversations list |
+| `registerSidePanel` | the toggle sits in the button group in the conversation page header; the panel is fixed on the right, and the main area gives up its width |
+| `registerMenuItem` / `registerSettingsSection` / `registerSettingsPanel` | the runtime's own "Extensions" page (a sidebar entry appears when something is registered) |
+
+Buttons and sidebar rows are clones of the native controls next to them with the icon and text
+replaced, so their look follows Claude. For each host a fingerprint is computed from "which items are
+registered", and the DOM is left alone while it is unchanged; nodes inserted by the runtime carry
+`data-codex-plus-claude`, containers handed to extensions to draw carry `data-codex-plus-ext`, and
+scans recognize their own writes by these two attributes. When an anchor is not found, that spot does
+not appear and "not attached" is reported with `status`; the rest of the extension keeps working.
+
+Not yet positioned: `registerToolView` (the tool-call block has not been measured), and for
+`registerSlot` `composer.left` / `composer.right` / `composer.model`, `home.above`, `settings.nav`,
+`activity.after`, `approval`, `header.title`, `sidebar.section`, `sessionRow.prefix`,
+`projectRow.suffix`. Registering them is not an error and nothing appears; `codexPlus.supports()`
+returns `false` for them.
+
+The anchors were measured against the Chat tab of the recorded UI, in both layouts, the merged home
+page (B) and the classic home page (A) (see `dev/README.md`); the Cowork and Code tabs and the
+Built-in UI have not been measured yet, where only the DOM-independent parts are guaranteed to work.
+
+### The page calls the backend
+
+`POST /__codex_plus/api/v1/<op>`; the request body and the response are both JSON, and the response
+is `{ "ok": true, "result": … }` or `{ "ok": false, "error": "…", "code": "…" }`.
+
+| op | Request body | Effect |
+| --- | --- | --- |
+| `call` | `{ key, method, params, timeoutMs?, instance? }` | calls a backend method; the backend process is started on the first call |
+| `events` | `{ key, since, waitMs }` | long-polls events the backend `emit`s; `since: "latest"` starts from the current end of the queue |
+| `stop` | `{ key, instance? }` | sent when the page instance unloads; under Claude the backend is not stopped |
+| `route` | `{ key, route, payload }` | calls an open route: `/diagnostics/log`, `/backend/status` |
+| `status` | `{ scripts, mounts }` | the page reports each extension's load result; written to `CLAUDE_LOCAL_PAGE_STATUS` |
+| `config` | `{ key, values }` | changes config from the page; only supported by an external host |
+
+A request must satisfy all of the following: the Claude main domain, `POST`,
+`Content-Type: application/json`, `Sec-Fetch-Site: same-origin`, an `Origin` on the Claude main
+domain, and a request header `x-codex-plus-ext` equal to the random token of this launch (delivered
+together with the runtime script). It is then checked against the injection plan: the pack must be
+enabled, the method must be in `claudeDesktop.methods`, and the route must be in the manifest's
+`permissions.routes`. Request bodies are capped at 1 MiB, responses at 4 MiB, and each extension may
+have at most 16 concurrent calls.
+
+This validation limits what the page can do to what extensions have declared, but it is not
+isolation between extensions: official scripts and extension scripts in the page have equal rights,
+and the token cannot be hidden from them. That is why secret config entries (`secret`) are not
+delivered to the page and are handed to the backend only.
+
+### Backend
+
+Backends are managed by `ext-backend.mjs`, with `ext-backend-runner.mjs` as the runner: one Node
+process per extension pack, with its data directory (`extension-data/<id>`) as the working directory,
+and the local service's own `CLAUDE_LOCAL_*`, `CODEX_PLUS_*` and `ANTHROPIC_*` removed from the
+environment. A backend restarts on the next call when its script or config changes, and is stopped
+after 30 minutes idle, when the extension is disabled, or when the local service exits. A backend
+script has the form `export default function create(ctx)` and returns a table of methods; `ctx` has
+`extension`, `host` (`"claudeDesktop"`), `config`, `dataDir`, `emit`, `provide`, `service` and `log`,
+plus `sessionQuery`, `sessions`, `llm` and `ui`, which always report an error under Claude.
+
+### External host
+
+When `CLAUDE_LOCAL_EXT_HOST_RECEIPT` is set, `call`, `events` and `config` are validated locally and
+then forwarded to `http://127.0.0.1:<port>/claude-ext/v1/<op>`: the request body is the same as in
+the table above, the request header `x-codex-plus-claude-ext` carries the token from the
+credentials, and the response has the same shape as the page API. When the credentials file cannot
+be read, the answer is `503` with `code: "host_offline"`.

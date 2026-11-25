@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN" data-mode="light" data-build-id="preview">
+<head>
+<meta charset="utf-8">
+<title>Claude（预览外壳）</title>
+<!-- 开发用的假外壳：只为在普通浏览器里看拓展运行时的界面。结构和 data-testid 是照缓存的 Claude 前端里搜到的名字搭的，
+     不代表真实页面；锚点以 DOM 探针量到的为准。颜色变量取自 Claude 的样式表。 -->
+<style>
+  [data-mode=light]{--bg-000:0 0% 100%;--bg-100:48 33.3% 97.1%;--bg-200:53 28.6% 94.5%;--bg-300:48 25% 92.2%;--bg-400:50 20.7% 88.6%;--border-300:30 3.3% 11.8%;--text-000:60 2.6% 7.6%;--text-100:60 2.6% 7.6%;--text-200:60 2.5% 23.3%;--text-300:60 2.5% 23.3%;--text-400:51 3.1% 43.7%;--accent-brand:15 63.1% 59.6%;--danger-100:0 56.2% 45.4%}
+  [data-mode=dark]{--bg-000:60 2.1% 18.4%;--bg-100:60 2.7% 14.5%;--bg-200:30 3.3% 11.8%;--bg-300:60 2.6% 7.6%;--bg-400:0 0% 0%;--border-300:51 16.5% 84.5%;--text-000:48 33.3% 97.1%;--text-100:48 33.3% 97.1%;--text-200:50 9% 73.7%;--text-300:50 9% 73.7%;--text-400:48 4.8% 59.2%;--accent-brand:15 63.1% 59.6%;--danger-100:0 56.2% 45.4%}
+  html,body{height:100%;margin:0}
+  body{display:flex;font:14px/1.5 system-ui,sans-serif;background:hsl(var(--bg-100));color:hsl(var(--text-100))}
+  nav{width:260px;flex:none;display:flex;flex-direction:column;gap:2px;padding:12px 8px;background:hsl(var(--bg-200));border-right:1px solid hsl(var(--border-300)/.12)}
+  nav a{display:flex;align-items:center;height:32px;padding:0 10px;border-radius:8px;color:inherit;text-decoration:none}
+  nav a:hover{background:hsl(var(--bg-300))}
+  main{flex:1;min-width:0;display:flex;flex-direction:column}
+  header{height:48px;flex:none;display:flex;align-items:center;padding:0 16px;font-weight:600}
+  .thread{flex:1;overflow:auto;padding:16px 24px;display:flex;flex-direction:column;gap:16px;max-width:760px;width:100%;margin:0 auto;box-sizing:border-box}
+  .bubble{align-self:flex-end;max-width:70%;padding:10px 14px;border-radius:12px;background:hsl(var(--bg-300))}
+  .actions{display:flex;gap:4px;margin-top:6px}
+  .actions button,.composer button{width:32px;height:32px;border:0;border-radius:8px;background:transparent;color:hsl(var(--text-300));cursor:pointer}
+  .actions button:hover,.composer button:hover{background:hsl(var(--bg-300))}
+  .composer{max-width:760px;width:calc(100% - 48px);margin:0 auto 24px;box-sizing:border-box;padding:12px;border-radius:14px;background:hsl(var(--bg-000));border:1px solid hsl(var(--border-300)/.15)}
+  .composer [contenteditable]{min-height:48px;outline:none}
+  .composer .row{display:flex;align-items:center;gap:6px}
+  .composer .send{margin-left:auto;background:hsl(var(--accent-brand));color:#fff}
+</style>
+<script>if (location.search.includes("dark")) document.documentElement.setAttribute("data-mode", "dark");</script>
+<!--EXTENSIONS-->
+</head>
+<body>
+  <nav data-testid="sidebar">
+    <a href="/new">＋ 新对话</a>
+    <div data-testid="sidebar-recents">
+      <a href="/chat/0f8fad5b-d9cb-469f-a165-70867728950e">示例会话一</a>
+      <a href="/chat/7c9e6679-7425-40de-944b-e07fc1f90ae7">示例会话二</a>
+    </div>
+    <a data-testid="user-menu-button" href="#" style="margin-top:auto">用户</a>
+  </nav>
+  <main data-testid="chat-column">
+    <header data-testid="chat-header">预览外壳</header>
+    <div class="thread" data-testid="chat-column-body">
+      <div>
+        <div class="bubble" data-testid="user-message">你好</div>
+        <div class="actions" data-testid="user-message-actions"><button data-testid="user-message-copy" aria-label="复制">⧉</button><button data-testid="user-message-edit" aria-label="编辑">✎</button></div>
+      </div>
+      <div>
+        <div data-testid="assistant-message">你好，有什么可以帮你的？</div>
+        <div class="actions" data-testid="message-actions"><button aria-label="复制">⧉</button><button aria-label="重试">↻</button></div>
+      </div>
+    </div>
+    <div class="composer">
+      <div contenteditable="true" data-testid="chat-input" role="textbox" aria-label="输入消息"></div>
+      <div class="row">
+        <button aria-label="添加">＋</button>
+        <button data-testid="model-selector-dropdown" aria-label="模型" style="width:auto;padding:0 10px">模型 ▾</button>
+        <button class="send" data-testid="chat-input-send" aria-label="发送">↑</button>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

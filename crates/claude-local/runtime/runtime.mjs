@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { validConnector } from "./connectors.mjs";
+import { installablePlugin } from "./plugins.mjs";
+import { validProject } from "./projects.mjs";
 
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MAX_TEXT = 1024 * 1024;
@@ -105,6 +110,14 @@ export function runtimeConfig(env = process.env) {
     defaultWindow,
     recordedDir,
     localization: flag("LOCALIZATION"),
+    // 页面扩展（见 extensions.mjs）：先内置后用户的扩展目录，和记录启用了哪些的状态文件。
+    extensionDirs: [env.CLAUDE_LOCAL_BUILTIN_EXTENSIONS_DIR, env.CLAUDE_LOCAL_EXTENSIONS_DIR].filter(Boolean),
+    extensionsState: env.CLAUDE_LOCAL_EXTENSIONS_STATE || "",
+    // Codex++ 拓展包（codexpp.json）：宿主程序写的注入计划、页面回报加载结果的文件，
+    // 以及外部托管方（Codex++ 自己托管拓展后台时）的凭据文件。
+    pagePlan: env.CLAUDE_LOCAL_PAGE_PLAN || "",
+    pageStatus: env.CLAUDE_LOCAL_PAGE_STATUS || "",
+    extHostReceipt: env.CLAUDE_LOCAL_EXT_HOST_RECEIPT || "",
     voiceInput: flag("VOICE_INPUT"),
     computerUse: flag("COMPUTER_USE"),
     backgroundMode: flag("BACKGROUND_MODE"),
@@ -113,6 +126,10 @@ export function runtimeConfig(env = process.env) {
     forceBackgroundMode: env.CLAUDE_LOCAL_FORCE_BACKGROUND_MODE === "1",
     // Cowork 总开关（GrowthBook yukon_silver，见 proxy.mjs 的 resolvedBootstrap）；没设置时按开。
     cowork: flag("COWORK"),
+    // 实验性：有模板时页面外壳也用本机 Claude 自带的版本（见 proxy.mjs 的 useOfficialShell）。
+    // 只认显式的 1：模板数据是配线上页面的，配本机页面目前缺汉化、账号和会话列表。
+    hubHome: env.CLAUDE_LOCAL_HUB_HOME === "1",
+    template: (env.CLAUDE_LOCAL_TEMPLATE || "").trim(),
     // 录制 bootstrap 里自带的原生模型（Opus / Sonnet / Haiku …）不对应任何供应商，
     // 选了也会被 gatewayModel 换成默认模型；默认从选择器里拿掉，只留供应商池里的。
     hideUnroutedModels: flag("HIDE_UNROUTED_MODELS"),
@@ -144,11 +161,194 @@ export function gatewayTarget(config, requestPath) {
   return target;
 }
 
+const OPENCODE_FALLBACK_SESSION = crypto.randomUUID();
+
+/**
+ * OpenCode Go（opencode.ai）要求每个请求带 x-opencode-session，缺了回 400 MissingSessionID（#42）。
+ * 它按会话分缓存，同一会话要一直用同一个值：`sessionId()` 给出会话 ID；没有会话的请求
+ * （标题生成、Claude 的模型探测）用进程启动时生成的固定值。其它上游不加。
+ */
+export function opencodeSessionHeaders(target, sessionId = () => "") {
+  if (!/(^|\.)opencode\.ai$/i.test(target.hostname)) return {};
+  const value = sessionId();
+  const valid = typeof value === "string" && /^[\x21-\x7e]{1,200}$/.test(value);
+  return { "x-opencode-session": valid ? value : OPENCODE_FALLBACK_SESSION };
+}
+
+/** /v1/messages 请求里 Claude 自己的会话 ID：请求头，或 metadata 里的 session_id / user_id 中的会话段。 */
+export function requestSessionId(headers, body) {
+  const header = headers["x-claude-code-session-id"];
+  if (typeof header === "string" && header) return header;
+  try {
+    const metadata = JSON.parse(body.toString("utf8"))?.metadata;
+    if (typeof metadata?.session_id === "string" && metadata.session_id) return metadata.session_id;
+    if (typeof metadata?.user_id === "string") {
+      return metadata.user_id.match(/session(?:_id)?["':_\s]*([0-9a-f]{8}-[0-9a-f-]{27})/i)?.[1] || "";
+    }
+  } catch {}
+  return "";
+}
+
+const WINDOW_SUFFIX = /\[\d+[km]\]$/i;
+
+function uniqueModelAlias(models, requested) {
+  const target = requested.replace(WINDOW_SUFFIX, "");
+  if (!target) return;
+  const suffix = requested.slice(target.length).toLowerCase();
+  let bestRank = 0;
+  let match;
+  for (const id of models) {
+    const name = id.replace(WINDOW_SUFFIX, "");
+    const candidateSuffix = id.slice(name.length).toLowerCase();
+    if (suffix && candidateSuffix && suffix !== candidateSuffix) continue;
+    const fullName = name === target;
+    if (!fullName && !name.endsWith(`.${target}`) && !name.endsWith(`/${target}`)) continue;
+    const rank = (fullName ? 3 : 1) + Number(suffix !== "" && suffix === candidateSuffix);
+    if (rank > bestRank) {
+      bestRank = rank;
+      match = id;
+    } else if (rank === bestRank) {
+      match = undefined;
+    }
+  }
+  return match;
+}
+
 export function gatewayModel(config, requested) {
+  if (typeof requested !== "string" || !requested) return config.model;
   if (config.models.includes(requested)) return requested;
-  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested || "")) return config.smallModel;
-  if (config.managed || !requested || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
+  const matched = uniqueModelAlias(config.models, requested);
+  if (matched) return matched;
+
+  if (/^(?:claude-)?haiku(?:-|$)/i.test(requested)) return config.smallModel;
+  if (config.managed || /^(?:claude-|sonnet|opus|haiku)/i.test(requested)) return config.model;
   return requested;
+}
+
+const GATEWAY_RAW_LIMIT = 1 << 20;
+
+function gatewayErrorText(value) {
+  if (!isRecord(value)) return "";
+  const error = value.error;
+  if (typeof error === "string") return error;
+  if (isRecord(error) && typeof error.message === "string") return error.message;
+  return typeof value.message === "string" ? value.message : "";
+}
+
+function clip(text, limit = 300) {
+  const value = String(text).replace(/\s+/g, " ").trim();
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/** 上游 /v1/messages 回了非 2xx 时给用户看的原因：状态码 + 上游自己的错误信息。 */
+export function gatewayHttpError(status, body) {
+  const raw = Buffer.isBuffer(body) ? body.toString("utf8") : String(body || "");
+  let detail = "";
+  try { detail = gatewayErrorText(JSON.parse(raw)); } catch {}
+  detail = clip(detail || raw);
+  return detail ? `上游返回 HTTP ${status}：${detail}` : `上游返回 HTTP ${status}`;
+}
+
+/**
+ * 解析上游 /v1/messages 的流式响应（只取文本）。
+ *
+ * 各家网关并不都按规范来：事件之间用 CRLF 分隔、一个事件多行 data、流里带 `type:"error"`、
+ * 不发 message_stop 就结束，甚至无视 stream:true 直接回一整段 JSON。以前遇到这些
+ * 一律静默结束，Claude 只能显示「连接已中断」；这里统一归结为 text / stop / error 三种回调。
+ */
+export function createGatewayStreamParser({ text, stop, error }) {
+  const decoder = new StringDecoder("utf8");
+  let buf = "";
+  let pendingCr = false;
+  let raw = "";
+  let sawEvent = false;
+  let sawText = false;
+  let finished = false;
+
+  const finish = (fn, ...args) => {
+    if (finished) return;
+    finished = true;
+    fn(...args);
+  };
+  const dispatch = (block) => {
+    const data = block
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(line.startsWith("data: ") ? 6 : 5))
+      .join("\n")
+      .trim();
+    if (!data) return;
+    sawEvent = true;
+    if (data === "[DONE]" || finished) return;
+    let event;
+    try { event = JSON.parse(data); } catch { return; }
+    if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
+      sawText = true;
+      text(event.delta.text);
+    } else if (event.type === "message_stop") {
+      finish(stop);
+    } else if (event.type === "error" || (event.error && !event.type)) {
+      finish(error, `上游返回错误：${clip(gatewayErrorText(event) || data)}`);
+    }
+  };
+  const feed = (chunk) => {
+    let next = (pendingCr ? "\r" : "") + chunk;
+    pendingCr = next.endsWith("\r");
+    if (pendingCr) next = next.slice(0, -1);
+    if (!sawEvent && raw.length < GATEWAY_RAW_LIMIT) raw += next;
+    buf += next.replace(/\r\n?/g, "\n");
+    let index;
+    while ((index = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, index);
+      buf = buf.slice(index + 2);
+      dispatch(block);
+    }
+  };
+  return {
+    write(chunk) {
+      feed(typeof chunk === "string" ? chunk : decoder.write(chunk));
+    },
+    end() {
+      feed(decoder.end() + (pendingCr ? "\n" : ""));
+      if (buf.trim()) dispatch(buf);
+      buf = "";
+      if (finished) return;
+      if (!sawEvent) {
+        // 不是 SSE：可能是网关忽略了 stream:true，回了整段 JSON（正常回复或错误）。
+        let value = null;
+        try { value = JSON.parse(raw); } catch {}
+        const message = gatewayErrorText(value);
+        if (value && (value.type === "error" || (value.error && !Array.isArray(value.content)))) {
+          return finish(error, `上游返回错误：${clip(message || raw)}`);
+        }
+        const blocks = Array.isArray(value?.content) ? value.content : [];
+        const reply = blocks.filter((block) => block?.type === "text").map((block) => block.text || "").join("");
+        if (reply) {
+          text(reply);
+          return finish(stop);
+        }
+        return finish(error, raw.trim()
+          ? `上游返回的不是流式回复：${clip(raw)}`
+          : "上游没有返回任何内容");
+      }
+      // 有的网关流完不发 message_stop；有文本就当正常结束。
+      if (sawText) return finish(stop);
+      return finish(error, "上游没有返回任何内容");
+    },
+  };
+}
+
+/**
+ * 凭据文件是否只有当前用户能读：普通文件、不是链接、属主是自己、其他人没有权限。
+ * Windows 上 lstat 的 mode 恒为 0o666、没有 uid，POSIX 权限位不反映 ACL，
+ * 按它校验必然失败（听写一直 503，#16）；那里只检查是普通文件、不是链接，
+ * 权限交给所在的用户目录（%APPDATA%）自身的 ACL。
+ */
+export function isPrivateFile(metadata, { platform = process.platform, uid = process.getuid?.() } = {}) {
+  if (!metadata.isFile() || metadata.isSymbolicLink()) return false;
+  if (platform === "win32") return true;
+  if ((metadata.mode & 0o077) !== 0) return false;
+  return uid === undefined || metadata.uid === uid;
 }
 
 export function gatewayBody(config, raw) {
@@ -190,6 +390,101 @@ export function dropUnroutedModels(bootstrap, config) {
       if (isRecord(selector)) selector.models = keep(selector.models, "id");
     }
   }
+}
+
+// 录制模板里第一项通常是被套餐限制的原生模型，带着这组字段：disabled /
+// disabled_reason（upgrade_required）/ selection_notice（CTA「升级」）/ badge
+// （「Pro、Max 或 Ultra」）。池内模型已经全部可用，这些限制不该跟着模板复制，
+// 否则选择器里每个上游模型都显示「升级」，点它只会打开订阅页。
+const MODEL_GATE_KEYS = [
+  "badge", "disabled", "disabled_reason", "selection_notice",
+  "notice", "notice_text", "tooltip", "inactive", "min_claude_code_version",
+];
+
+function clearModelGates(entry) {
+  for (const key of MODEL_GATE_KEYS) delete entry[key];
+  return entry;
+}
+
+/**
+ * 把网关池模型并入录制 bootstrap 的模型清单（就地修改）。
+ *
+ * 原生条目先拿来当新条目的模板；模板里的套餐限制先用 `clearModelGates`
+ * 摘掉，名称与副标题用池里的友好名。`hideUnroutedModels`（默认开）时
+ * 最后把池外条目删掉，选择器里只剩 provider/model 条目。
+ */
+export function mergePoolModels(bootstrap, config) {
+  const ids = config.models;
+  if (!isRecord(bootstrap) || !ids.length) return;
+  const label = (id) => modelLabel(config, id);
+  const cfg = bootstrap.activeOrganization?.claude_ai_bootstrap_models_config;
+  if (Array.isArray(cfg)) {
+    const seen = new Set(cfg.map((m) => m?.model));
+    const tpl = cfg[0] ?? {};
+    for (const entry of cfg) {
+      if (!isRecord(entry) || !ids.includes(entry.model)) continue;
+      clearModelGates(entry);
+      entry.hard_limit = modelWindow(config, entry.model);
+      entry.context_window = modelWindow(config, entry.model);
+    }
+    for (const id of ids) {
+      if (!seen.has(id)) cfg.push(clearModelGates({
+        ...tpl,
+        model: id,
+        name: label(id).name,
+        description: label(id).description || id,
+        hard_limit: modelWindow(config, id),
+        context_window: modelWindow(config, id),
+      }));
+    }
+  }
+  const avail = bootstrap.claude_ai_available_models?.models;
+  if (Array.isArray(avail)) {
+    const seen = new Set(avail.map((m) => m?.model_id));
+    for (const id of ids) {
+      if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
+    }
+  }
+  if (Array.isArray(bootstrap.model_selector_config)) {
+    for (const sel of bootstrap.model_selector_config) {
+      if (!Array.isArray(sel?.models)) continue;
+      const seen = new Set(sel.models.map((m) => m?.id));
+      const tpl = sel.models[0] ?? {};
+      for (const entry of sel.models) {
+        if (!isRecord(entry) || !ids.includes(entry.id)) continue;
+        clearModelGates(entry);
+        entry.disabled = false;
+        entry.disabled_reason = null;
+        entry.hard_limit = modelWindow(config, entry.id);
+        entry.context_window = modelWindow(config, entry.id);
+        entry.runtime = { max_input_tokens: modelWindow(config, entry.id) };
+      }
+      for (const id of ids) {
+        if (seen.has(id)) continue;
+        const entry = clearModelGates({
+          ...tpl,
+          id,
+          name: label(id).name,
+          short_name: label(id).name,
+          description: label(id).description || id,
+          hard_limit: modelWindow(config, id),
+          context_window: modelWindow(config, id),
+          runtime: { max_input_tokens: modelWindow(config, id) },
+        });
+        // 清掉模板的限制后再补上明确的「可用」，与 modelSelectors() 生成的条目一致。
+        entry.disabled = false;
+        entry.disabled_reason = null;
+        sel.models.push(entry);
+      }
+    }
+  }
+  if (Array.isArray(bootstrap.model_selector_state)) {
+    const thinking = { type: "effort", effort: "medium" };
+    bootstrap.model_selector_state = bootstrap.model_selector_state.map((s) => s && typeof s === "object"
+      ? { ...s, model: config.model, thinking_by_model: ids.map((id) => ({ id, thinking })) }
+      : s);
+  }
+  if (config.hideUnroutedModels) dropUnroutedModels(bootstrap, config);
 }
 
 /** 选择器里的名称与副标题：有友好名用友好名（副标题是供应商），否则名称沿用模型 id、副标题为空。 */
@@ -285,6 +580,7 @@ function validateConversation(conv) {
     isDate(conv.created_at) && isDate(conv.updated_at) &&
     Number.isSafeInteger(conv.nextIndex) && conv.nextIndex >= 0 &&
     (conv.leafMessageId === null || isId(conv.leafMessageId)) &&
+    (conv.project_uuid === undefined || conv.project_uuid === null || isId(conv.project_uuid)) &&
     Array.isArray(conv.turns) && conv.turns.length <= 10000 && conv.turns.every(validateTurn) &&
     Array.isArray(conv.chat_messages) && conv.chat_messages.length <= 20000 &&
     conv.chat_messages.every((message) => isRecord(message) && isId(message.uuid) &&
@@ -310,7 +606,22 @@ function validateNotifications(entry) {
           ["push_source", "email_source"].includes(key) && isText(value, 64))));
 }
 
-export function createStateStore(file, conversations, notifications, warn = () => {}) {
+/**
+ * 本机和局域网里的地址。出站代理是按「怎么连 claude.ai」选出来的，系统代理的例外名单没带过来：
+ * 局域网里的上游（NAS、另一台机器上的网关）不能绕去代理，代理软件开着全局模式时会连不上。
+ */
+export function isLocalNetworkHost(hostname) {
+  const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".local") || !/[.:]/.test(host)) return true;
+  if (net.isIPv4(host)) return /^(?:10|127)\.|^192\.168\.|^169\.254\.|^172\.(?:1[6-9]|2\d|3[01])\./.test(host);
+  return net.isIPv6(host) && (host === "::1" || /^(?:f[cd]|fe[89ab])/.test(host));
+}
+
+/**
+ * `plugins`：装上的插件，id → 安装时那份目录记录。`connectors`：添加的连接器，uuid → 记录（含登录令牌）。
+ * `projects`：项目，uuid → 记录（知识正文和文件不在这里，见 projects.mjs）。旧状态文件没有这几项。
+ */
+export function createStateStore(file, conversations, notifications, warn = () => {}, plugins = new Map(), connectors = new Map(), projects = new Map()) {
   let timer;
   let disabled = false;
   if (file && fs.existsSync(file)) {
@@ -320,7 +631,13 @@ export function createStateStore(file, conversations, notifications, warn = () =
       if (!isRecord(state) || state.version !== 1 || !Array.isArray(state.conversations) ||
         state.conversations.length > 2000 || !state.conversations.every(validateConversation) ||
         !Array.isArray(state.notifications) || state.notifications.length > 2000 ||
-        !state.notifications.every(validateNotifications)) throw new Error("Invalid state contract");
+        !state.notifications.every(validateNotifications) ||
+        !(state.plugins === undefined || Array.isArray(state.plugins) && state.plugins.length <= 500 &&
+          state.plugins.every(installablePlugin)) ||
+        !(state.connectors === undefined || Array.isArray(state.connectors) && state.connectors.length <= 500 &&
+          state.connectors.every(validConnector)) ||
+        !(state.projects === undefined || Array.isArray(state.projects) && state.projects.length <= 2000 &&
+          state.projects.every(validProject))) throw new Error("Invalid state contract");
       for (const conv of state.conversations) {
         // 中断的请求不自动重发，避免重启后重复计费或执行。
         for (const turn of conv.turns) {
@@ -334,6 +651,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
         conversations.set(conv.uuid, conv);
       }
       for (const entry of state.notifications) notifications.set(entry.org, entry.value);
+      for (const entry of state.plugins ?? []) plugins.set(entry.id, entry);
+      for (const entry of state.connectors ?? []) connectors.set(entry.uuid, entry);
+      for (const entry of state.projects ?? []) projects.set(entry.uuid, entry);
     } catch {
       disabled = true;
       warn("Local conversation state is invalid; the original file was preserved");
@@ -349,6 +669,9 @@ export function createStateStore(file, conversations, notifications, warn = () =
         version: 1,
         conversations: [...conversations.values()],
         notifications: [...notifications].map(([org, value]) => ({ org, value })),
+        plugins: [...plugins.values()],
+        connectors: [...connectors.values()],
+        projects: [...projects.values()],
       }));
       if (body.length > MAX_STATE_BYTES) throw new Error("State exceeds size limit");
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });

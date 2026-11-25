@@ -92,6 +92,20 @@ pub trait Host: Send + Sync {
         bail!("当前程序只支持完整功能模式")
     }
 
+    /// 宿主自己目录里启用中的 Claude 页面拓展包（Codex++ 的 `user_scripts` 里声明了 `claudeDesktop.renderer` 的包）。
+    /// 它们和本库目录里的包并进同一份注入计划；开关、配置由宿主管，变了要调
+    /// [`crate::extensions::refresh_page_plan`]。默认没有。
+    fn page_packages(&self) -> Vec<crate::extensions::HostPagePackage> {
+        Vec::new()
+    }
+
+    /// 宿主自己托管拓展后台时，返回它写的凭据文件（`{ "port", "token" }`）：本地服务把页面的后台调用
+    /// 原样转到 `http://127.0.0.1:<port>/claude-ext/v1/<op>`，自己不再起后台，同一个拓展只有一个后台实例。
+    /// 默认 `None`：本地服务自带后台运行器。
+    fn extension_host_receipt(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// 诊断日志；默认丢弃。
     fn diagnostic(&self, _event: &str, _detail: Value) {}
 }
@@ -110,6 +124,11 @@ pub fn install_host(host: Arc<dyn Host>) -> bool {
 
 pub(crate) fn host() -> &'static Arc<dyn Host> {
     HOST.get().expect("claude_local::install_host 必须在使用前调用")
+}
+
+/// 宿主交来的页面拓展包；还没装宿主（单元测试）时为空。
+pub(crate) fn page_packages() -> Vec<crate::extensions::HostPagePackage> {
+    HOST.get().map(|host| host.page_packages()).unwrap_or_default()
 }
 
 pub(crate) fn diagnostic(event: &str, detail: Value) {

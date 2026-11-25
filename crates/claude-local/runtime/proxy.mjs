@@ -22,11 +22,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Duplex } from "node:stream";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { ConnectorError, connectorRecord, createConnectorService } from "./connectors.mjs";
 import { createConversationService } from "./conversation-service.mjs";
 import { isPatchedStartupAsset, startupAssets } from "./scripts/patch-dictation-start.mjs";
-import { createStateStore, dropUnroutedModels, gatewayBody, gatewayModel, gatewayTarget, modelLabel, modelList, modelSelectors, modelWindow, planProfile, runtimeConfig } from "./runtime.mjs";
-import { createOfficialAssets } from "./official-assets.mjs";
+import { createGatewayStreamParser, createStateStore, gatewayBody, gatewayHttpError, gatewayModel, gatewayTarget, isPrivateFile, mergePoolModels, modelList, modelSelectors, isLocalNetworkHost, modelWindow, opencodeSessionHeaders, planProfile, requestSessionId, runtimeConfig } from "./runtime.mjs";
+import { createOfficialAssets, loadCoworkSystemPrompt } from "./official-assets.mjs";
+import { EXTENSION_PREFIX, PAGE_PACKAGE_PREFIX, PAGE_RUNTIME_PATH, createExtensions, createPagePlan } from "./extensions.mjs";
+import { createBackendHost, defaultRunnerPath } from "./ext-backend.mjs";
+import { PAGE_API_PREFIX, createPageApi } from "./page-api.mjs";
+import { DIRECTORY_MARKETPLACE, installablePlugin, installedDirectoryRecord, libraryItem, pluginRecord, pluginRepository, zipSubtree } from "./plugins.mjs";
+import { createBlobStore, createProjectApi, withProjectContext, withProjectMessages } from "./projects.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const runtime = runtimeConfig();
@@ -37,6 +45,8 @@ const LOCALIZATION_SHIM_PATH = "/__codex_plus/claude-localization.js";
 const localizationShim = runtime.managed && !runtime.recordedDir && runtime.localization
   ? fs.readFileSync(path.join(here, "page-shim.js"))
   : null;
+
+const LOCAL_CATALOG_VERSION = "local.local";
 
 function addLocalizationShim(html, officialLocales) {
   if (!localizationShim) return html;
@@ -54,10 +64,12 @@ function addLocalizationShim(html, officialLocales) {
     const match = entry.trim().match(/^([\w-]+):([\w-]+)\.([\w-]+)$/);
     if (match) catalogs.set(match[1], `${match[2]}.${match[3]}`);
   }
+  // 版本号必须是「基础词表.动态词表」两段：前端按 /^([\w-]+):([\w-]+)\.([\w-]+)$/ 解析，
+  // 以前写的 1.1.1 是三段，整张表都解析失败、语言列表变空，界面就退回英文。
   for (const locale of officialLocales) {
-    if (!catalogs.has(locale)) catalogs.set(locale, "1.1.1");
+    if (!catalogs.has(locale)) catalogs.set(locale, LOCAL_CATALOG_VERSION);
   }
-  catalogs.set("zh-Hans", catalogs.get("zh-Hans") ?? "1.1.1");
+  catalogs.set("zh-Hans", catalogs.get("zh-Hans") ?? LOCAL_CATALOG_VERSION);
   const catalogValue = [...catalogs]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([locale, versions]) => `${locale}:${versions}`)
@@ -77,6 +89,61 @@ function addLocalizationShim(html, officialLocales) {
 const officialShell = runtime.managed
   ? addLocalizationShim(officialAssets.indexHtml, officialAssets.i18nLocales)
   : null;
+
+// 页面扩展（见 extensions.mjs）：启用中的扩展的 js / css 以同源地址插进页面外壳，每次请求现读。
+const extensions = runtime.managed && runtime.extensionDirs.length && runtime.extensionsState
+  ? createExtensions({ dirs: runtime.extensionDirs.map((dir) => path.resolve(dir)), stateFile: runtime.extensionsState })
+  : null;
+
+// Codex++ 拓展包（codexpp.json）：页面运行时和每个包各是一个同源脚本，内容来自宿主程序写的注入计划（见 extensions.mjs）。
+// 页面经 /__codex_plus/api/v1/ 调后台（见 page-api.mjs）；令牌每次启动现生成，随运行时脚本下发。
+const pagePlan = runtime.managed && runtime.pagePlan
+  ? createPagePlan({ planFile: path.resolve(runtime.pagePlan), isPrivate: isPrivateFile })
+  : null;
+const PAGE_TOKEN = crypto.randomBytes(32).toString("hex");
+const backendHost = pagePlan
+  ? createBackendHost({ runner: defaultRunnerPath(path.dirname(fileURLToPath(import.meta.url))), log: (...a) => log(...a) })
+  : null;
+const pageApi = pagePlan
+  ? createPageApi({
+    plan: pagePlan,
+    backends: backendHost,
+    token: PAGE_TOKEN,
+    origins: new Set(["https://claude.ai", "https://claude.com"]),
+    statusFile: runtime.pageStatus ? path.resolve(runtime.pageStatus) : "",
+    hostReceipt: runtime.extHostReceipt ? path.resolve(runtime.extHostReceipt) : "",
+    isPrivate: isPrivateFile,
+    log: (...a) => log(...a),
+  })
+  : null;
+
+// 插在官方脚本之前（有本地化 shim 时在它之后），这样扩展能赶在页面脚本前做事（比如包一层 fetch）。
+// 页面脚本带 nonce 时抄给我们的标签：线上外壳的 CSP 按 nonce 放行脚本。
+// 拓展包的脚本带 defer：等页面解析完再按顺序执行（那时 <body> 已经在了），仍然早于官方的模块脚本。
+function addExtensions(body) {
+  const assets = [
+    ...(extensions?.assets() ?? []),
+    ...(pagePlan?.scripts() ?? []).map((href) => ({ type: "script", href, defer: true })),
+  ];
+  if (!assets.length) return body;
+  const html = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+  const head = /<head\b[^>]*>/i.exec(html);
+  const headEnd = /<\/head\s*>/i.exec(html);
+  if (!head || !headEnd || head.index >= headEnd.index) return body;
+  const nonce = /<script\b[^>]*\bnonce=(["'])([\w+/=-]+)\1/i.exec(html)?.[2];
+  const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
+  const tags = assets.map(({ type, href, defer }) => type === "style"
+    ? `<link rel="stylesheet" href="${href}"${nonceAttr}>`
+    : `<script src="${href}"${nonceAttr}${defer ? " defer" : ""}></script>`).join("");
+  const contentStart = head.index + head[0].length;
+  const headContent = html.slice(contentStart, headEnd.index);
+  const shimTag = `<script src="${LOCALIZATION_SHIM_PATH}"></script>`;
+  const shimAt = headContent.indexOf(shimTag);
+  const firstScript = /<script\b/i.exec(headContent);
+  const insertAt = contentStart + (shimAt !== -1 ? shimAt + shimTag.length
+    : firstScript ? firstScript.index : headContent.length);
+  return Buffer.from(`${html.slice(0, insertAt)}${tags}${html.slice(insertAt)}`);
+}
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
@@ -97,12 +164,59 @@ const CACHE_DIR = process.env.CLAUDE_LOCAL_CACHE_DIR || path.join(here, ".cache"
 // 代理目录里来历不明的 mock 一律忽略（托管测试用 privateFixture 守住这条）。
 const TRUSTED_TEMPLATE = fs.existsSync(path.join(here, "mock", ".codex-plus-template"));
 const POC_DIR = runtime.recordedDir || (TRUSTED_TEMPLATE ? here : null);
-const POC_MOCK = path.join(POC_DIR ?? here, "mock");
+// 模板按录制版本放在 mock/<build>/（每个前端版本一组接口数据 + 页面外壳）。设置里选了哪个用哪个，
+// 没选或选的已经下架就用最新的（按外壳里的 data-build-timestamp）。没有版本目录时是旧的平铺布局
+// （开发用的录制目录 CLAUDE_LOCAL_RECORDED_DIR 也是这样），直接用 mock/。
+const TEMPLATE_ROOT = path.join(POC_DIR ?? here, "mock");
+function templateBuildTime(dir) {
+  try {
+    const head = fs.readFileSync(path.join(dir, "shell.html")).subarray(0, 4096).toString("utf8");
+    return Number(head.match(/\bdata-build-timestamp="(\d+)"/)?.[1]) || 0;
+  } catch {
+    return -1;
+  }
+}
+function pickTemplate() {
+  if (!POC_DIR) return TEMPLATE_ROOT;
+  let versions = [];
+  try {
+    versions = fs.readdirSync(TEMPLATE_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^[\w-]+$/.test(entry.name) &&
+        fs.existsSync(path.join(TEMPLATE_ROOT, entry.name, "bootstrap.json")))
+      .map((entry) => entry.name);
+  } catch {}
+  if (!versions.length) return TEMPLATE_ROOT;
+  if (runtime.template && versions.includes(runtime.template)) return path.join(TEMPLATE_ROOT, runtime.template);
+  const newest = versions
+    .map((name) => ({ name, time: templateBuildTime(path.join(TEMPLATE_ROOT, name)) }))
+    .sort((a, b) => b.time - a.time || a.name.localeCompare(b.name))[0].name;
+  return path.join(TEMPLATE_ROOT, newest);
+}
+const POC_MOCK = pickTemplate();
 const POC_I18N = path.join(POC_DIR ?? here, "i18n");
 // 托管模式在存在 PoC 数据（dev 录制目录或安装的内嵌 mock 模板）时走 PoC 数据路径；
 // 完全没有模板数据时保持合成兜底（officialShell/localBootstrap + 状态告警）。
 const dataManaged = runtime.managed && !POC_DIR;
+// 页面外壳用本机 Claude 自带的版本（ion-dist）：资源都在本地，不用每逢线上换版本就补拉上千个文件，
+// 首次启动也不依赖能连上 claude.ai。只在没有模板数据时这样用：本机这份是 Claude 第三方模式的界面，
+// 配上按 claude.ai 录制的模板数据对不上；要用它请选「本机版」界面（第三方模式启动）。
+const useOfficialShell = Boolean(officialShell) && dataManaged;
+// 模板自带的页面外壳（mock/shell.html）：与模板数据同一次录制、同一个前端版本。
+// 有它时主站的页面导航一律用它，不看缓存、不去线上抓：线上页面会换版本，
+// 配上按旧版本录制的模板就会界面错乱、Code 页卡在加载（新用户没有缓存时必然拿到线上版本）。
+const TEMPLATE_SHELL = (() => {
+  if (!POC_DIR) return null;
+  try {
+    const body = fs.readFileSync(path.join(POC_MOCK, "shell.html"));
+    return body.length >= 4096 && /<html\b[^>]*\bdata-build-id="[^"]+"/i.test(body.subarray(0, 4096).toString("utf8"))
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+})();
 const READ_CACHE = POC_DIR ? path.join(POC_DIR, ".cache") : CACHE_DIR;
+
 const LOG = arg("log", "1") !== "0";
 const READY_FILE = process.env.CLAUDE_LOCAL_READY_FILE;
 const INSTANCE_ID = process.env.CLAUDE_LOCAL_INSTANCE_ID || crypto.randomUUID();
@@ -113,8 +227,11 @@ const MAX_DICTATION_WS_CONNECTIONS = 4;
 const MAX_DICTATION_WS_BYTES = 26 * 1024 * 1024;
 const MAX_DICTATION_WS_IDLE_MS = 130_000;
 const MAX_DICTATION_WS_DURATION_MS = 16 * 60_000;
+// Desktop 的 policy-limits 校验器要求 restrictions 是非 null 对象（不能是数组）；
+// compliance_taints 可选数组，defaults 可选对象。
+const POLICY_LIMITS = { restrictions: {}, compliance_taints: [], defaults: {}, artifact_create_notice: null };
 const DICTATION_ALLOWED_HOSTS = new Set(["claude.ai", "claude.com", "api.anthropic.com"]);
-const DICTATION_ALLOWED_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
+const DESKTOP_WEB_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
 let lastClientAt = null;
 let listeningPort = PORT;
 let persistenceWarning = null;
@@ -253,6 +370,37 @@ function loadRecordedBootstrap() {
 
 const RECORDED_BOOTSTRAP = loadRecordedBootstrap();
 
+// Cowork 的系统提示词由官方桌面端通过 system_prompts.cowork_system_prompt 下发。
+// 本地 mock 缺这一项时，渲染端拿到的提示词是空的，会直接报「Cowork 目前不可用」。
+// 优先从本机 app.asar 读（不在仓库里分发官方文本），读不到时用下面的兜底文案。
+const FALLBACK_COWORK_SYSTEM_PROMPT = [
+  "<application_details>",
+  "Claude is operating as an agent inside the Claude desktop app. The agent is built on Claude Code and the Claude Agent SDK, but Claude should not present itself as Claude Code.",
+  "</application_details>",
+  "",
+  "<claude_behavior>",
+  "Work directly on the user's task with the file tools and the sandboxed Linux shell. Prefer the file tools for reading and writing files; use the shell for commands. Save deliverables in the workspace folder the user selected, and keep internal sandbox paths out of user-facing explanations unless they are relevant.",
+  "</claude_behavior>",
+].join("\n");
+let coworkSystemPromptCache;
+function coworkSystemPrompt() {
+  if (coworkSystemPromptCache !== undefined) return coworkSystemPromptCache;
+  const prompt = loadCoworkSystemPrompt(process.env.CLAUDE_LOCAL_DESKTOP_RESOURCES, process.env.CLAUDE_LOCAL_COWORK_PROMPT_FILE);
+  coworkSystemPromptCache = prompt || FALLBACK_COWORK_SYSTEM_PROMPT;
+  return coworkSystemPromptCache;
+}
+function coworkSystemPrompts() {
+  return {
+    cowork_system_prompt: {
+      value: { prompt: coworkSystemPrompt() },
+      on: true,
+      off: false,
+      source: "defaultValue",
+      ruleId: null,
+    },
+  };
+}
+
 // i18n 字典：.cache 里录制过的真实翻译文件（url 形如 claude.ai/i18n/s/zh-Hans.json?v=...）
 const i18nMap = (() => {
   const m = new Map(); // pathname -> abs body file
@@ -326,6 +474,29 @@ function localI18n(pathname) {
 const now = () => new Date().toISOString();
 const log = (...a) => LOG && console.log(`[${now()}]`, ...a);
 
+// Chat 的 completion 请求体字段随客户端版本变化：从常见位置兜底取最近一条用户文本（跳过助手消息）。
+function firstUserText(value, depth = 0) {
+  if (depth > 4 || value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && !Array.isArray(value) && typeof value.role === "string" && value.role !== "user") return "";
+  if (Array.isArray(value)) {
+    for (let i = value.length - 1; i >= 0; i -= 1) {
+      const text = firstUserText(value[i], depth + 1);
+      if (text) return text;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    for (const key of ["text", "content", "prompt", "message"]) {
+      if (Object.hasOwn(value, key)) {
+        const text = firstUserText(value[key], depth + 1);
+        if (text) return text;
+      }
+    }
+  }
+  return "";
+}
+
 function json(res, obj, code = 200, extraHeaders = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -385,17 +556,33 @@ function noteClient() {
 
 const CONV_STATE = new Map();
 const NOTIFICATION_SETTINGS = new Map();
+const INSTALLED_PLUGINS = new Map(); // 插件 id → 安装时的目录记录
+const CONNECTORS = new Map(); // 连接器 uuid → 记录（见 connectors.mjs）
+const PROJECTS = new Map(); // 项目 uuid → 记录（见 projects.mjs）
 let DEVICE_ROW = null; // Code 模式注册的设备行 {id, k, ...}
 const stateStore = createStateStore(STATE_FILE, CONV_STATE, NOTIFICATION_SETTINGS, (warning) => {
   persistenceWarning = warning;
   console.error(warning);
+}, INSTALLED_PLUGINS, CONNECTORS, PROJECTS);
+const projectApi = createProjectApi({
+  projects: PROJECTS,
+  // 项目知识的正文和上传的文件放在状态文件旁边，不进状态文件。
+  blobs: createBlobStore(STATE_FILE ? path.join(path.dirname(STATE_FILE), "project-files") : null),
+  account: ACCOUNT,
+  changed: () => stateStore.flush(),
+  conversations: () => [...CONV_STATE.values()],
+  conversationRecord: (conv) => convToRest(conv),
+  removeConversation: (uuid) => CONV_STATE.delete(uuid),
+  json,
+  readBody,
+  decodeJsonBody,
 });
 
 function ensureConv(uuid) {
   if (!CONV_STATE.has(uuid)) {
     CONV_STATE.set(uuid, {
       uuid,
-      name: "New conversation",
+      name: "",
       created_at: now(),
       updated_at: now(),
       chat_messages: [],
@@ -417,6 +604,9 @@ const conversationService = createConversationService({
   listConvs: () => [...CONV_STATE.values()],
   log,
   onChange: (flush) => flush ? stateStore.flush() : stateStore.changed(),
+  request: (target, options, callback) => gatewayRequest(target, options, callback),
+  projectContext: (conv) => projectApi.context(conv.project_uuid),
+  hasProject: (uuid) => projectApi.has(uuid),
 });
 
 function pushMessage(conv, msg) {
@@ -616,79 +806,6 @@ function localBootstrap() {
   });
 }
 
-// 选择器里显示的名称与副标题：有友好名用友好名（副标题是供应商），否则沿用模型 id。
-const friendlyName = (id) => modelLabel(runtime, id).name;
-const friendlyDescription = (id) => modelLabel(runtime, id).description || id;
-
-// PoC 数据路径下：把网关池模型并入录制 bootstrap 的模型字段。
-// 原生条目先拿来当新条目的模板；`hideUnroutedModels`（默认开）时最后再把它们删掉，
-// 选择器里只剩池内 provider/model 条目。
-function mergePoolModels(j) {
-  const ids = runtime.models;
-  if (!j || typeof j !== "object" || !ids.length) return;
-  const cfg = j.activeOrganization?.claude_ai_bootstrap_models_config;
-  if (Array.isArray(cfg)) {
-    const seen = new Set(cfg.map((m) => m?.model));
-    const tpl = cfg[0] ?? {};
-    for (const entry of cfg) {
-      if (entry && runtime.models.includes(entry.model)) {
-        entry.hard_limit = modelWindow(runtime, entry.model);
-        entry.context_window = modelWindow(runtime, entry.model);
-      }
-    }
-    for (const id of ids) {
-      if (!seen.has(id)) cfg.push({
-        ...tpl,
-        model: id,
-        name: friendlyName(id),
-        description: friendlyDescription(id),
-        hard_limit: modelWindow(runtime, id),
-        context_window: modelWindow(runtime, id),
-      });
-    }
-  }
-  const avail = j.claude_ai_available_models?.models;
-  if (Array.isArray(avail)) {
-    const seen = new Set(avail.map((m) => m?.model_id));
-    for (const id of ids) {
-      if (!seen.has(id)) avail.push({ model_id: id, minimum_tier: "free" });
-    }
-  }
-  if (Array.isArray(j.model_selector_config)) {
-    for (const sel of j.model_selector_config) {
-      if (!Array.isArray(sel?.models)) continue;
-      const seen = new Set(sel.models.map((m) => m?.id));
-      const tpl = sel.models[0] ?? {};
-      for (const entry of sel.models) {
-        if (entry && runtime.models.includes(entry.id)) {
-          entry.hard_limit = modelWindow(runtime, entry.id);
-          entry.context_window = modelWindow(runtime, entry.id);
-          entry.runtime = { max_input_tokens: modelWindow(runtime, entry.id) };
-        }
-      }
-      for (const id of ids) {
-        if (!seen.has(id)) sel.models.push({
-          ...tpl,
-          id,
-          name: friendlyName(id),
-          short_name: friendlyName(id),
-          description: friendlyDescription(id),
-          hard_limit: modelWindow(runtime, id),
-          context_window: modelWindow(runtime, id),
-          runtime: { max_input_tokens: modelWindow(runtime, id) },
-        });
-      }
-    }
-  }
-  if (Array.isArray(j.model_selector_state)) {
-    const thinking = { type: "effort", effort: "medium" };
-    j.model_selector_state = j.model_selector_state.map((s) => s && typeof s === "object"
-      ? { ...s, model: runtime.model, thinking_by_model: ids.map((id) => ({ id, thinking })) }
-      : s);
-  }
-  if (runtime.hideUnroutedModels) dropUnroutedModels(j, runtime);
-}
-
 function mockEdgeApi(req, res, url) {
   const p = url.pathname.replace(/\/+$/, "");
   if (p.includes("/edge-api/bootstrap")) {
@@ -711,7 +828,57 @@ function forceCowork(result, template) {
   };
 }
 
+// claude_ai_hub_web_delivery：Claude 的合并式主页，对话和 Cowork 合在一个输入框里，没有「对话 | Cowork」切换。
+// 录制模板的账号在 chatwork_free_experiment 实验组里，这个开关是开的。设置里没选合并式主页时关掉它，
+// 用回有切换的经典主页。
+const HUB_DELIVERY_FEATURE_ID = "2436273311";
+function useClassicHome(result, template) {
+  if (template?.org_growthbook?.features && result.org_growthbook?.features) {
+    result.org_growthbook = {
+      ...result.org_growthbook,
+      features: { ...result.org_growthbook.features, [HUB_DELIVERY_FEATURE_ID]: { defaultValue: false } },
+    };
+  }
+  // 合并式主页的代码是按 gated_imports 下发的，光关 GrowthBook 开关不够：前端看到这一项仍会装上它。
+  if (result.gated_imports?.claude_ai_hub_web_delivery) {
+    const { claude_ai_hub_web_delivery: _hub, ...rest } = result.gated_imports;
+    result.gated_imports = rest;
+  }
+}
+
+// 连接器登录在应用内完成，页面这一侧的开关（桌面端那一侧是 /api/desktop/features 里的 600735300）。
+// 较早的录制版本里没有这一项。
+const CONNECTOR_SIGN_IN_FEATURE_ID = "1286103945";
+function allowConnectorSignIn(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [CONNECTOR_SIGN_IN_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
+// 项目知识里能传图片：GrowthBook 功能 `project_image`（id 同样是功能名的 hashCode）。录制模板里是 false，
+// 知识面板就只收文档。图片由本地项目接口存下、对话时发给模型（见 projects.mjs）。
+const PROJECT_IMAGE_FEATURE_ID = "3346981045";
+function allowProjectImages(result, template) {
+  if (!template?.org_growthbook?.features || !result.org_growthbook?.features) return;
+  result.org_growthbook = {
+    ...result.org_growthbook,
+    features: { ...result.org_growthbook.features, [PROJECT_IMAGE_FEATURE_ID]: { defaultValue: true } },
+  };
+}
+
 let resolvedBootstrapCache;
+// 主页问候语里带着称呼：模板里是「Local User」（脱敏时换的），按设置里的用户名换掉。
+const TEMPLATE_DISPLAY_NAME = "Local User";
+function withDisplayName(value) {
+  if (displayName === TEMPLATE_DISPLAY_NAME) return value;
+  if (typeof value === "string") return value.split(TEMPLATE_DISPLAY_NAME).join(displayName);
+  if (Array.isArray(value)) return value.map(withDisplayName);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, withDisplayName(item)]));
+  return value;
+}
+
 function resolvedBootstrap() {
   if (resolvedBootstrapCache) return resolvedBootstrapCache;
   let template = RECORDED_BOOTSTRAP ?? {};
@@ -726,15 +893,116 @@ function resolvedBootstrap() {
     ...result.served_copy,
     "web.plan_name.max_20x": runtime.localization ? "Codex++ 本地网关" : "Codex++ local gateway",
   };
-  if (runtime.cowork) forceCowork(result, template);
-  mergePoolModels(result);
+  // 录制账号自己的状态，不属于本地模式：身份验证待办（hold_notice）会让 Claude 弹「完成验证以继续」、拦掉回复。
+  result.hold_notice = null;
+  result.personalized_greeting = withDisplayName(result.personalized_greeting);
+  if (runtime.cowork) {
+    result.system_prompts = { ...result.system_prompts, ...coworkSystemPrompts() };
+    forceCowork(result, template);
+  }
+  if (!runtime.hubHome) useClassicHome(result, template);
+  allowConnectorSignIn(result, template);
+  allowProjectImages(result, template);
+  result.gated_messages = withProjectMessages(result.gated_messages);
+  if (useOfficialShell) {
+    // 模板里的 gated_imports 是录制时线上版本的分块清单，与本机外壳对不上：换成本机版本。
+    result.gated_imports = {};
+    result.gated_imports_build_id = officialAssets.buildId;
+  }
+  mergePoolModels(result, runtime);
   resolvedBootstrapCache = result;
   return result;
 }
 
 // REST 侧的会话条目：拿录制文件里的第一条当模板，叠动态字段
 let REST_CONV_TEMPLATE = null;
-function convToRest(c) {
+/**
+ * 模板里录下的 Anthropic 示例技能，内容只能从 Anthropic 下载，本地模式一个都装不上。
+ * 原样标成「已启用」的话，Claude 每次同步都要去下载、全部失败（0 downloaded / 5 failed）。
+ */
+function offlineSkills(data) {
+  if (!Array.isArray(data?.skills)) return data;
+  return { ...data, skills: data.skills.map((skill) => ({ ...skill, enabled: false })) };
+}
+
+// 记忆（#43）：本地网关没有记忆合成，模型请求也不带记忆。这里只让设置页读写的形状对得上
+// （{} 会被 zod 判为缺 memory / controls / updated_at，报「无法保存记忆」），改动在本次运行内保留。
+let MEMORY_SETTINGS;
+function memorySettings() {
+  if (!MEMORY_SETTINGS) {
+    try {
+      if (!dataManaged) MEMORY_SETTINGS = JSON.parse(fs.readFileSync(path.join(POC_MOCK, "api", "memory_settings.json"), "utf8"));
+    } catch {}
+    MEMORY_SETTINGS ??= {
+      enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
+      memory_mode: "melange", classic_mode_available: false,
+      melange_available: false, melange_imported_at: null,
+    };
+  }
+  return MEMORY_SETTINGS;
+}
+/** memory_mode 按客户端乐观更新的同一套规则推算。 */
+function updateMemorySettings(body) {
+  const settings = memorySettings();
+  for (const key of ["enabled_saffron", "enabled_saffron_search", "enabled_melange"]) {
+    if (typeof body[key] === "boolean") settings[key] = body[key];
+  }
+  if ("enabled_melange" in body) {
+    settings.memory_mode = body.enabled_melange === true ? "melange" : body.enabled_saffron === true ? "classic" : "off";
+  } else if ("enabled_saffron" in body && settings.memory_mode !== "melange") {
+    settings.memory_mode = body.enabled_saffron === true ? "classic" : "off";
+  }
+  if (body.clear_data === true) setMemoryControls(null);
+  return settings;
+}
+const MEMORY = {
+  memory: "", controls: null, updated_at: null,
+  controls_version: null, project_import: null, project_memory_mode: null,
+};
+function setMemoryControls(controls) {
+  MEMORY.controls = controls?.length ? controls : null;
+  MEMORY.memory = (controls ?? []).map((c) => `- ${c}`).join("\n");
+  MEMORY.controls_version = controls ? crypto.randomUUID() : null;
+  MEMORY.updated_at = controls ? now() : null;
+}
+
+function restTime(value, fallback) {
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toISOString() : fallback;
+}
+
+/**
+ * 会话详情里的消息。REST 的 /completion 记在 chat_messages；claudeai-rpc 记在 turns，
+ * 两边都要能读出来，否则从另一条路径建的会话打开就是空的。
+ */
+function restMessages(c) {
+  // 旧版状态文件可能把数组字段缺省或显式置为 null；新版前端会直接对其调用 .some()/.map()。
+  const withArrays = (message) => ({
+    ...message,
+    files: Array.isArray(message?.files) ? message.files : [],
+    files_v2: Array.isArray(message?.files_v2) ? message.files_v2 : [],
+    attachments: Array.isArray(message?.attachments) ? message.attachments : [],
+    sync_sources: Array.isArray(message?.sync_sources) ? message.sync_sources : [],
+  });
+  if (c.chat_messages?.length) return c.chat_messages.map(withArrays);
+  const messages = [];
+  for (const turn of c.turns || []) {
+    const created = restTime(turn.created, c.created_at);
+    const entry = (uuid, sender, index, parent, text, extra = {}) => withArrays({
+      uuid, sender, index, parent_message_uuid: parent ?? null, text,
+      content: [{ type: "text", text, citations: [] }],
+      created_at: created, updated_at: created, ...extra,
+    });
+    messages.push(entry(turn.humanId, "human", turn.humanIndex, turn.humanParent, turn.prompt || ""));
+    if (turn.complete || turn.text) {
+      messages.push(entry(turn.asstId, "assistant", turn.asstIndex, turn.humanId, turn.text || "",
+        turn.complete ? { stop_reason: turn.stopReason === "error" ? "error" : "end_turn" } : {}));
+    }
+  }
+  return messages;
+}
+
+function convToRest(c, { messages = false } = {}) {
   if (!REST_CONV_TEMPLATE) {
     try {
       if (dataManaged) throw new Error("Managed mode uses synthetic data");
@@ -743,19 +1011,125 @@ function convToRest(c) {
     } catch { REST_CONV_TEMPLATE = {}; }
   }
   const live = c.turns?.some((t) => !t.complete);
+  const title = c.name && c.name !== "New conversation" ? c.name : "";
+  const project = c.project_uuid ? PROJECTS.get(c.project_uuid) : undefined;
   return {
     ...REST_CONV_TEMPLATE,
+    // 新版前端会对这些字段直接调用数组/对象操作；录制的 conversations.json 可能为空，
+    // 而旧模板字段也可能是 null，因此本地 API 必须保证返回正确形状。
+    settings: REST_CONV_TEMPLATE.settings && typeof REST_CONV_TEMPLATE.settings === "object" ? REST_CONV_TEMPLATE.settings : {},
+    project_uuid: project ? project.uuid : null,
+    ...(project ? { project: { uuid: project.uuid, name: project.name } } : {}),
+    is_starred: REST_CONV_TEMPLATE.is_starred ?? false,
+    is_archived: REST_CONV_TEMPLATE.is_archived ?? false,
+    files: Array.isArray(REST_CONV_TEMPLATE.files) ? REST_CONV_TEMPLATE.files : [],
+    sync_sources: Array.isArray(REST_CONV_TEMPLATE.sync_sources) ? REST_CONV_TEMPLATE.sync_sources : [],
     uuid: c.uuid,
     id: c.uuid,
-    name: c.name || "New conversation",
-    summary: c.name || "New conversation",
+    name: title,
+    summary: title,
     model: c.model || runtime.model,
     created_at: c.created_at,
     updated_at: c.updated_at,
-    current_leaf_message_uuid: c.leafMessageId || null,
+    current_leaf_message_uuid: c.leafMessageId || c.current_leaf_message_uuid || null,
     live_status: live ? "running" : null,
     last_settled_at: live ? null : c.updated_at,
+    ...(messages ? { chat_messages: restMessages(c) } : {}),
   };
+}
+
+function extractTitleInput(rawText) {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (!text) return "";
+  const first = text.match(/^Message 1:\s*([\s\S]*?)(?:\n+\s*Message 2:|$)/i);
+  return (first ? first[1] : text).trim();
+}
+
+function fallbackSessionTitle(rawText, emptyFallback = "New task") {
+  const cleaned = extractTitleInput(rawText)
+    .replace(/^["'“”‘’`《【]+|["'“”‘’`》】]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return emptyFallback;
+  return cleaned.length > 30 ? `${cleaned.slice(0, 30)}…` : cleaned;
+}
+
+function sanitizeGeneratedTitle(raw) {
+  if (typeof raw !== "string") return "";
+  const tagged = raw.match(/<title>([\s\S]*?)<\/title>/i);
+  const line = (tagged ? tagged[1] : raw)
+    .replace(/\r?\n[\s\S]*$/, "")
+    .replace(/^["'“”‘’`*#:\s]+|["'“”‘’`*\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!line) return "";
+  return line.length > 80 ? `${line.slice(0, 80)}…` : line;
+}
+
+function generateSessionTitle(rawText, requestedModel, emptyFallback, callback, sessionId) {
+  const input = extractTitleInput(rawText);
+  const fallback = fallbackSessionTitle(input, emptyFallback);
+  if (!input) return callback(fallback);
+  let target;
+  try {
+    target = gatewayTarget(runtime, "/v1/messages");
+  } catch {
+    return callback(fallback);
+  }
+  const model = gatewayModel(runtime, runtime.smallModel || requestedModel || runtime.model);
+  const payload = JSON.stringify({
+    model,
+    max_tokens: 128,
+    stream: false,
+    // 推理模型默认先输出 thinking，标题这种短任务会被 thinking 吃满 budget。
+    thinking: { type: "disabled" },
+    system: "Generate a concise session title (3-8 words or short Chinese phrase) in the same language as the user message. Reply with only the title, no quotes or markdown.",
+    messages: [{ role: "user", content: input.slice(0, 2000) }],
+  });
+  let settled = false;
+  const finish = (title) => {
+    if (settled) return;
+    settled = true;
+    callback(title || fallback);
+  };
+  const greq = gatewayRequest(
+    target,
+    {
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: target.pathname + target.search,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+        "x-api-key": runtime.key,
+        authorization: `Bearer ${runtime.key}`,
+        "anthropic-version": "2023-06-01",
+        ...opencodeSessionHeaders(target, () => sessionId),
+      },
+      // 网关在跑长任务时首字可能排队：标题生成等久一点，别退回“截断提示词”。
+      timeout: 20000,
+    },
+    (gres) => {
+      const chunks = [];
+      gres.on("data", (chunk) => chunks.push(chunk));
+      gres.on("end", () => {
+        if (gres.statusCode !== 200) return finish(fallback);
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          const text = Array.isArray(data.content)
+            ? data.content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("")
+            : (typeof data.completion === "string" ? data.completion : "");
+          finish(sanitizeGeneratedTitle(text) || fallback);
+        } catch {
+          finish(fallback);
+        }
+      });
+    },
+  );
+  greq.on("timeout", () => { greq.destroy(); finish(fallback); });
+  greq.on("error", () => finish(fallback));
+  greq.end(payload);
 }
 
 function mockApi(req, res, url) {
@@ -777,7 +1151,7 @@ function mockApi(req, res, url) {
 
   const convGet = p.match(/\/chat_conversations\/([0-9a-f-]{36})$/);
   if (convGet && method === "GET") {
-    return json(res, convToRest(ensureConv(convGet[1])));
+    return json(res, convToRest(ensureConv(convGet[1]), { messages: true }));
   }
 
   // 会话列表：静态模板 + 运行期动态会话（RPC 建的）合并，按更新时间倒序
@@ -794,12 +1168,29 @@ function mockApi(req, res, url) {
     return json(res, { ...base, data: merged });
   }
 
+  if (/^\/api\/organizations\/[^/]+\/memory\/settings$/.test(p)) {
+    if (method === "GET") return json(res, memorySettings());
+    return readBody(req, (raw) => json(res, updateMemorySettings(decodeJsonBody(req, raw))));
+  }
+  const memoryMatch = p.match(/^\/api\/organizations\/[^/]+\/memory(?:\/(controls|synthesize|reset))?$/);
+  if (memoryMatch) {
+    if (method === "GET" || memoryMatch[1] === "synthesize") return json(res, MEMORY);
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      if (memoryMatch[1] === "controls" && Array.isArray(body.controls)) {
+        setMemoryControls(body.controls.filter((c) => typeof c === "string"));
+      } else if (memoryMatch[1] === "reset") {
+        setMemoryControls(null);
+      }
+      json(res, MEMORY);
+    });
+  }
+
   // 录制下来的真实接口形状（mock/api/*.json）
   const apiMap = [
     [/\/reflections\/settings$/, "reflections_settings"],
     [/\/user_settings$/, "claude_code_user_settings"],
     [/\/mcp\/remote_servers_with_connection$/, "mcp_servers"],
-    [/\/memory\/settings$/, "memory_settings"],
     [/^\/api\/account_profile$/, "account_profile"],
     [/\/trial_status$/, "trial_status"],
     [/\/skills\/list-skills$/, "skills"],
@@ -811,6 +1202,7 @@ function mockApi(req, res, url) {
       if (!dataManaged && fs.existsSync(f)) {
         try {
           const data = JSON.parse(fs.readFileSync(f, "utf8"));
+          if (slug === "skills") return json(res, offlineSkills(data));
           return slug === "account_profile"
             ? jsonWithActiveOrg(res, normalizeAccountProfile(data))
             : json(res, data);
@@ -824,11 +1216,6 @@ function mockApi(req, res, url) {
             checksum: "local-1", content: { entries: {} },
           },
           mcp_servers: [],
-          memory_settings: {
-            enabled_saffron: null, enabled_saffron_search: false, enabled_melange: null,
-            memory_mode: "melange", classic_mode_available: false,
-            melange_available: false, melange_imported_at: null,
-          },
           account_profile: {
             work_function: "", conversation_preferences: null, cowork_global_instructions: null,
             cowork_instructions_union: false, conversation_preferences_cloud_max_chars: 10000,
@@ -863,6 +1250,20 @@ function mockApi(req, res, url) {
         value: { enabled: runtime.computerUse, appScopedEnabled: runtime.computerUse && runtime.backgroundMode },
         on: runtime.computerUse, off: !runtime.computerUse, source: "force",
         experiment: null, experimentResult: null,
+      },
+      // Windows 上计算机使用的另一道门：Claude 里是 `process.platform==="win32"&&!X("40173473")` 就不给开，
+      // 设置页显示「您的账户尚未启用计算机使用功能」。macOS 不读它。
+      "40173473": {
+        value: runtime.computerUse, on: runtime.computerUse, off: !runtime.computerUse, source: "force",
+        experiment: null, experimentResult: null,
+      },
+      // 账号插件的同步：关着时桌面端不读已装列表、不下载插件、会话里也不挂载（见 pluginApi）。
+      "2340532315": {
+        value: true, on: true, off: false, source: "force", experiment: null, experimentResult: null,
+      },
+      // 连接器登录在应用内完成（见 connectors.mjs）：关着时桌面端不报这个能力，页面会改走经过真 claude.ai 的登录。
+      "600735300": {
+        value: true, on: true, off: false, source: "force", experiment: null, experimentResult: null,
       },
     };
     // 后台模式的 macOS 版本上限（Claude 内置默认 26.x，系统更新就提示「暂不支持」）。
@@ -943,6 +1344,15 @@ function mockApi(req, res, url) {
     });
   }
 
+  // 插件安装状态核对：客户端要求 `checked` 数组；通用 library 分页结构会触发加载错误。
+  // 空数组表示都还在，桌面端不会删本地已装的插件。
+  if (method === "POST" && /^\/api\/organizations\/[^/]+\/library\/plugins\/installed_check$/.test(p)) {
+    return json(res, { checked: [] });
+  }
+  if (pluginApi(req, res, url, p)) return;
+  if (connectorApi(req, res, url, p)) return;
+  if (projectApi.handle(req, res, url, p)) return;
+
   // 分页/列表类接口：客户端会 flatMap 取 .items/.data，回 {} 会出 [undefined] 元素
   // → render 时 TypeError 进 fatal boundary（0NV6PUA 崩溃页的来源）
   // 列表页校验（shared-l-p-m-w-0 rG）：{data:[...], pagination:{has_more:boolean}} 必须成立
@@ -951,11 +1361,6 @@ function mockApi(req, res, url) {
     pagination: { has_more: false, next_cursor: null, cursor: null },
   };
   if (/\/library(\/|$)/.test(p)) return json(res, pageShape);
-  if (/\/projects\/count$/.test(p)) return json(res, { count: 0 });
-  if (/\/projects(_v2)?$/.test(p)) return json(res, pageShape);
-  if (/\/plugins\/list-plugins$/.test(p)) {
-    return json(res, { plugins: [], installed_plugin_ids: [] });
-  }
   // Code 模式 OAuth：刷新 token（被通用 /v1/ 兜底吃掉会导致 stale_relogin 常驻）
   if (p === "/v1/oauth/token" && req.method === "POST") {
     return json(res, {
@@ -972,7 +1377,7 @@ function mockApi(req, res, url) {
   // 否则 EventSource 收到 application/json 会中断连接，Code 面板永远停在骨架屏。
   const wantsSse = req.headers.accept?.includes("text/event-stream");
   if (p === "/v1/code/sessions/watch" || p.startsWith("/v1/code/sessions/watch") ||
-      (wantsSse && (/^\/v1\//.test(p) || /\/mcp\/v2\/bootstrap$/.test(p)))) {
+      (wantsSse && /^\/v1\//.test(p))) {
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-store",
@@ -993,7 +1398,9 @@ function mockApi(req, res, url) {
   if (/\/marketplaces\//.test(p)) {
     return json(res, { ...pageShape, marketplaces: [] });
   }
+  if (method === "GET" && p === "/api/frame/types") return json(res, { ...pageShape, types: [] });
   if (p.startsWith("/api/frame/")) return json(res, pageShape);
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/plugins\/registry$/.test(p)) return json(res, { data: [] });
   // 客户端按 plugin id 读取元数据字典，每个值都必须是对象。
   if (p.endsWith("/cowork_plugin_metadata")) return json(res, {});
 
@@ -1081,20 +1488,19 @@ function mockApi(req, res, url) {
   if (p === "/api/bootstrap" || p === "/api/account" || p === "/api/account_profile") {
     return jsonWithActiveOrg(res, resolvedBootstrap());
   }
+  if (method === "GET" && /^\/api\/bootstrap\/[^/]+\/system_prompts$/.test(p)) {
+    return json(res, resolvedBootstrap().system_prompts ?? {});
+  }
   if (/^\/api\/bootstrap\/[^/]+\/app_start$/.test(p)) {
     return jsonWithActiveOrg(res, resolvedBootstrap());
   }
   if (p === "/api/organizations") {
     return jsonWithActiveOrg(res, { organizations: [ORG], data: [ORG], items: [ORG] });
   }
-  // org 级别的设置/记忆/skills 端点：未覆盖的通用 mock 形状会触发前端 parse 失败 notice
-  if (/\/memory\/settings/.test(p)) {
-    return json(res, { settings: {}, entries: [], items: [] });
-  }
   if (/\/skills\/download-dot-skill-file/.test(p)) {
-    // 区域封锁拿不到真 zip；回空 body 让下载器安静失败而不是 parse 报错
-    res.writeHead(204, { "content-length": 0 });
-    return res.end();
+    // 技能内容在 Anthropic 服务器上，本地拿不到。列表里已经都标成未启用（offlineSkills），
+    // 用户手动打开时回一个明确的 404，而不是 204 空体（Claude 会报「Response body is null」）。
+    return json(res, { type: "error", error: { type: "not_found_error", message: "本地模式没有这个技能的内容" } }, 404);
   }
   // 登录后组织选择页的数据源；item 的 uuid 要放在客户端读的位置（否则 join 打成 /undefined/join）
   if (p === "/api/organizations/discoverable") {
@@ -1121,29 +1527,112 @@ function mockApi(req, res, url) {
   if (/^\/api\/organizations\/[^/]+$/.test(p)) {
     return json(res, ORG);
   }
+  if (/\/dust\/generate_session_title$/.test(p) && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const firstMsg = body.first_session_message ?? body.message ?? body.prompt ?? "";
+      generateSessionTitle(firstMsg, body.model, "New task", (title) => json(res, { title }));
+    });
+  }
+  if (/\/dust\/generate_title_and_branch$/.test(p) && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const firstMsg = body.first_session_message ?? body.message ?? body.prompt ?? "";
+      generateSessionTitle(firstMsg, body.model, "New session", (title) => {
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50).replace(/-+$/, "");
+        json(res, { title, branch_name: slug ? `claude/${slug}` : undefined });
+      });
+    });
+  }
   if (/\/chat_conversations$/.test(p)) {
     if (method === "GET") return json(res, [...CONV_STATE.values()].map(convToRest));
     if (method === "POST") {
-      const id = crypto.randomUUID();
-      const conv = ensureConv(id);
-      return json(res, convToRest(conv), 201);
+      return readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const requestedId = typeof body.uuid === "string" && /^[0-9a-f-]{36}$/i.test(body.uuid)
+          ? body.uuid
+          : crypto.randomUUID();
+        const conv = ensureConv(requestedId);
+        if (projectApi.has(body.project_uuid)) {
+          conv.project_uuid = body.project_uuid;
+          stateStore.flush();
+        }
+        if (typeof body.name === "string" && body.name.trim()) {
+          conv.name = body.name.trim().slice(0, 200);
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        return json(res, convToRest(conv), 201);
+      });
     }
+  }
+  const convTitleMatch = p.match(/\/chat_conversations\/([0-9a-f-]{36})\/title$/);
+  if (convTitleMatch && method === "POST") {
+    return readBody(req, (raw) => {
+      const body = decodeJsonBody(req, raw);
+      const conv = ensureConv(convTitleMatch[1]);
+      const firstHuman = conv.chat_messages.find((m) => m.sender === "human")?.text || "";
+      const source = typeof body.message_content === "string" && body.message_content.trim()
+        ? body.message_content
+        : firstHuman;
+      generateSessionTitle(source, conv.model, "New conversation", (title) => {
+        if (title) {
+          conv.name = title;
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        json(res, { title });
+      }, convTitleMatch[1]);
+    });
   }
   const convMatch = p.match(/\/chat_conversations\/([^/]+)$/);
   if (convMatch) {
-    if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1])));
+    if (method === "PUT" || method === "PATCH") {
+      return readBody(req, (raw) => {
+        const body = decodeJsonBody(req, raw);
+        const conv = ensureConv(convMatch[1]);
+        if (typeof body.name === "string") {
+          conv.name = body.name.trim().slice(0, 200);
+          conv.updated_at = now();
+          stateStore.flush();
+        }
+        return json(res, convToRest(conv));
+      });
+    }
+    if (method === "DELETE") {
+      CONV_STATE.delete(convMatch[1]);
+      stateStore.flush();
+      res.writeHead(204, { "content-length": 0 });
+      return res.end();
+    }
+    if (CONV_STATE.has(convMatch[1])) return json(res, convToRest(ensureConv(convMatch[1]), { messages: true }));
     return json(res, { error: "not found" }, 404);
   }
   if (/\/completion$/.test(p)) {
-    let raw = "";
-    req.on("data", (c) => (raw += c));
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      let body = {};
-      try { body = JSON.parse(raw); } catch {}
-      const prompt = typeof body.prompt === "string" ? body.prompt : "";
+      const body = decodeJsonBody(req, Buffer.concat(chunks));
+      const prompt = (typeof body.prompt === "string" && body.prompt.trim() ? body.prompt : "")
+        || firstUserText(body.messages)
+        || firstUserText(body.message)
+        || firstUserText(body.content)
+        || "";
       const human = body.turn_message_uuids?.human_message_uuid || crypto.randomUUID();
       const asst = body.turn_message_uuids?.assistant_message_uuid || crypto.randomUUID();
-      const model = gatewayModel(runtime, body.model || process.env.GATEWAY_MODEL);
+      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
+      const conv = convUuid ? ensureConv(convUuid) : null;
+      const model = gatewayModel(runtime, body.model || conv?.model || process.env.GATEWAY_MODEL);
+      if (conv && conv.model !== model) {
+        conv.model = model;
+        stateStore.changed();
+      }
+      // 网页版不单独建会话：第一条消息的 create_conversation_params 里带着项目。
+      const projectUuid = body.create_conversation_params?.project_uuid;
+      if (conv && !conv.project_uuid && projectApi.has(projectUuid)) {
+        conv.project_uuid = projectUuid;
+        stateStore.changed();
+      }
       const sendEv = (ev, obj) => {
         res.write(`event: ${ev}\ndata: ${JSON.stringify(obj)}\n\n`);
       };
@@ -1157,22 +1646,39 @@ function mockApi(req, res, url) {
         message: { uuid: asst, parent_uuid: human, model: body.model || model, role: "assistant", content: [] },
       });
       sendEv("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-      const convUuid = (p.match(/\/chat_conversations\/([0-9a-f-]{36})\/completion/) || [])[1];
-      const conv = convUuid ? ensureConv(convUuid) : null;
       if (conv && !conv.chat_messages.some((m) => m.uuid === human)) {
         pushMessage(conv, { uuid: human, sender: "human", text: prompt });
+        if ((!conv.name || conv.name === "New conversation") && prompt.trim()) {
+          const compact = prompt.replace(/\s+/g, " ").trim();
+          conv.name = compact.length > 30 ? `${compact.slice(0, 30)}…` : compact;
+          stateStore.changed();
+        }
       }
       let acc = "";
-      const payload = JSON.stringify({
+      let settled = false;
+      // 上游出错时把原因写进回复里：只发 error 事件的话，Claude 只会显示「连接已中断」。
+      const fail = (message) => {
+        if (settled) return;
+        settled = true;
+        log(`completion failed${runtime.managed ? "" : `: ${message}`}`);
+        const text = `${acc ? "\n\n" : ""}[网关错误：${message}]`;
+        sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+        sendEv("content_block_stop", { type: "content_block_stop", index: 0 });
+        sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
+        sendEv("message_stop", { type: "message_stop" });
+        res.end();
+      };
+      const payload = JSON.stringify(withProjectContext({
         model,
-        max_tokens: 2048,
+        max_tokens: 4096,
         stream: true,
         messages: conv ? conv.chat_messages.map((message) => ({
           role: message.sender === "human" ? "user" : "assistant", content: message.text,
         })) : [{ role: "user", content: prompt }],
-      });
+      }, projectApi.context(conv?.project_uuid)));
       const target = gatewayTarget(runtime, "/v1/messages");
-      const greq = (target.protocol === "https:" ? https : http).request(
+      const greq = gatewayRequest(
+        target,
         {
           hostname: target.hostname,
           port: target.port || (target.protocol === "https:" ? 443 : 80),
@@ -1184,44 +1690,64 @@ function mockApi(req, res, url) {
             authorization: `Bearer ${runtime.key}`,
             "anthropic-version": "2023-06-01",
             accept: "text/event-stream",
+            ...opencodeSessionHeaders(target, () => convUuid),
           },
         },
         (gres) => {
-          let buf = "";
-          gres.on("data", (chunk) => {
-            buf += chunk.toString("utf8");
-            let i;
-            while ((i = buf.indexOf("\n\n")) >= 0) {
-              const ev = buf.slice(0, i);
-              buf = buf.slice(i + 2);
-              const dataLine = ev.split("\n").find((l) => l.startsWith("data:"));
-              if (!dataLine) continue;
-              let d;
-              try { d = JSON.parse(dataLine.slice(5).trim()); } catch { continue; }
-              if (d.type === "content_block_delta" && d.delta?.type === "text_delta") {
-                acc += d.delta.text;
-                sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: d.delta.text } });
-              } else if (d.type === "message_stop") {
-                if (conv && !conv.chat_messages.some((m) => m.uuid === asst)) {
-                  pushMessage(conv, { uuid: asst, sender: "assistant", parent: human, text: acc, stop_reason: "end_turn" });
-                  stateStore.flush();
-                }
-                sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
-                sendEv("message_stop", { type: "message_stop" });
-                res.end();
+          if (gres.statusCode < 200 || gres.statusCode >= 300) {
+            const chunks = [];
+            let size = 0;
+            gres.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
+            gres.on("end", () => fail(gatewayHttpError(gres.statusCode, Buffer.concat(chunks))));
+            gres.on("error", (e) => fail(e.message));
+            return;
+          }
+          const parser = createGatewayStreamParser({
+            text: (text) => {
+              if (settled) return;
+              acc += text;
+              sendEv("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+            },
+            stop: () => {
+              if (settled) return;
+              settled = true;
+              if (conv && !conv.chat_messages.some((m) => m.uuid === asst)) {
+                pushMessage(conv, { uuid: asst, sender: "assistant", parent: human, text: acc, stop_reason: "end_turn" });
+                stateStore.flush();
               }
-            }
+              sendEv("content_block_stop", { type: "content_block_stop", index: 0 });
+              sendEv("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" } });
+              sendEv("message_stop", { type: "message_stop" });
+              res.end();
+            },
+            error: fail,
           });
-          gres.on("end", () => { try { res.end(); } catch {} });
+          gres.on("data", (chunk) => parser.write(chunk));
+          gres.on("end", () => parser.end());
+          gres.on("error", (e) => fail(e.message));
         },
       );
-      greq.on("error", (e) => {
-        sendEv("error", { type: "error", error: { message: e.message } });
-        try { res.end(); } catch {}
-      });
+      greq.setTimeout(300_000, () => greq.destroy(new Error("上游超时：5 分钟没有响应")));
+      greq.on("error", (e) => fail(e.message));
+      res.on("close", () => { if (!settled) { settled = true; greq.destroy(); } });
       greq.end(payload);
     });
     return;
+  }
+  // 这两个接口 Claude 用 zod 校验：通用兜底的 {} 会报「Invalid BFF response format」，
+  // Cowork 提交任务时直接中断（来自 PR #8 的排查）。
+  if (method === "GET" && p === "/api/directory/servers") {
+    return json(res, { servers: [], next_cursor: null });
+  }
+  // 插件目录页校验 {data:[...]}；通用 {} 会触发 RegistryFetchError: expected array。
+  if (method === "GET" && (p === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(p))) {
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
+  }
+  if (method === "GET" && /\/dxt\/(?:extensions|installable_extensions)$/.test(p)) {
+    return json(res, { entries: [], total: 0 });
+  }
+  if (method === "GET" && /^\/api\/organizations\/[^/]+\/activation\/[^/]+\/tasks$/.test(p)) {
+    return json(res, { tasks: [] });
   }
   if (/\/completion_status/.test(p)) {
     return json(res, { is_pending: false, is_error: false });
@@ -1259,14 +1785,26 @@ function isHashedStaticAsset(req, url) {
     /\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:m?js|css|wasm|woff2?|ttf|otf|png|jpe?g|webp|gif|svg|ico)$/.test(url.pathname);
 }
 
-function bufferedResponseHeaders(headers, length) {
+function withoutHopByHop(headers) {
   const result = { ...headers };
   const connectionHeaders = String(result.connection || "").split(",").map((name) => name.trim().toLowerCase());
   for (const name of ["connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", ...connectionHeaders]) {
     delete result[name];
   }
+  return result;
+}
+
+function bufferedResponseHeaders(headers, length) {
+  const result = withoutHopByHop(headers);
   // Buffer 未解压，保留 content-encoding 并以实际传输字节数更新长度。
   result["content-length"] = length;
+  return result;
+}
+
+/** 原样转发的响应头：上游给了长度就沿用（下载器靠它显示进度），分块传输由 Node 重新分块。 */
+function streamedResponseHeaders(headers) {
+  const result = withoutHopByHop(headers);
+  if (headers["transfer-encoding"]) delete result["content-length"];
   return result;
 }
 
@@ -1297,6 +1835,24 @@ function readBody(req, cb) {
   req.on("error", () => cb(Buffer.alloc(0)));
 }
 
+// Chat 的 completion 请求体可能被客户端按 gzip/br/deflate 压缩；直接 JSON.parse 会得到 {}。
+function decodeJsonBody(req, raw) {
+  const encoding = String(req.headers["content-encoding"] || "").toLowerCase().trim();
+  let bytes = raw;
+  try {
+    if (encoding === "gzip" || encoding === "x-gzip") bytes = zlib.gunzipSync(raw);
+    else if (encoding === "br") bytes = zlib.brotliDecompressSync(raw);
+    else if (encoding === "deflate") bytes = zlib.inflateSync(raw);
+  } catch {
+    bytes = raw;
+  }
+  try {
+    return JSON.parse(bytes.toString("utf8") || "{}");
+  } catch {
+    return {};
+  }
+}
+
 // 文档导航判定：GET + 无扩展名 + 显式要 HTML。/api|/v1|/edge-api 等接口路径在此前分支已返回。
 function isDocNav(req, url) {
   return req.method === "GET" && !path.extname(url.pathname) &&
@@ -1321,8 +1877,9 @@ function readDocShell(host) {
 // 绝不回放登出落地页桩体——那会让 SPA 永远卡在骨架屏。
 function serveDocShell(req, res, url) {
   const host = url.host || "claude.ai";
-  const cached = readDocShell(host);
-  if (cached) {
+  const shell = readDocShell(host);
+  if (shell) {
+    const cached = addExtensions(shell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
       "content-length": cached.length,
@@ -1358,11 +1915,12 @@ function serveDocShell(req, res, url) {
             JSON.stringify({ status: 200, headers: { "content-type": "text/html" }, url: `${host}/epitaxy` }),
           );
         }
+        const page = r.statusCode === 200 && !r.headers["content-encoding"] ? addExtensions(body) : body;
         res.writeHead(r.statusCode || 502, {
           "content-type": "text/html; charset=utf-8",
-          "content-length": body.length,
+          "content-length": page.length,
         });
-        res.end(body);
+        res.end(page);
       });
     },
   );
@@ -1383,11 +1941,12 @@ function forwardGateway(req, res, requestPath, raw) {
   }
   const target = gatewayTarget(runtime, requestPath);
   const headers = {
+    ...opencodeSessionHeaders(target, () => requestSessionId(req.headers, body)),
     ...req.headers, host: target.host, "content-length": body.length,
     "x-api-key": runtime.key, authorization: `Bearer ${runtime.key}`,
   };
   for (const key of ["proxy-connection", "accept-encoding", "connection", "cookie", "transfer-encoding"]) delete headers[key];
-  const up = (target.protocol === "https:" ? https : http).request({
+  const up = gatewayRequest(target, {
     hostname: target.hostname, port: target.port || (target.protocol === "https:" ? 443 : 80),
     path: target.pathname + target.search, method: req.method, headers, timeout: 300000,
   }, (response) => {
@@ -1424,42 +1983,153 @@ function isLoopbackHost(hostname) {
   return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(String(hostname).toLowerCase());
 }
 
-/** 发往上游网页的请求：https 且配置了出站代理时先 CONNECT 打通隧道，再在隧道上做 TLS。 */
-function upstreamRequest(target, options, callback) {
-  const client = target.protocol === "http:" ? http : https;
-  if (!UPSTREAM_PROXY || target.protocol !== "https:" || isLoopbackHost(target.hostname)) {
-    return client.request(options, callback);
-  }
-  const port = Number(options.port || 443);
-  const authority = `${options.hostname}:${port}`;
-  const proxyAuth = UPSTREAM_PROXY.username
+function upstreamProxyAuth() {
+  return UPSTREAM_PROXY?.username
     ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(UPSTREAM_PROXY.username)}:${decodeURIComponent(UPSTREAM_PROXY.password)}`).toString("base64")}` }
     : {};
-  return https.request({
+}
+
+// 发往上游网页的请求共用连接池：首次启动（或线上页面换版本后）要补拉上千个前端资源，
+// 逐个新建连接会在代理软件 / 防火墙里刷出上千条 node 连接。每个主机最多并发这么多条，
+// 用完的连接留着复用，空闲一段时间后关掉。
+const UPSTREAM_MAX_SOCKETS_PER_HOST = 16;
+const UPSTREAM_IDLE_SOCKET_MS = 30_000;
+const UPSTREAM_POOL = { keepAlive: true, maxSockets: UPSTREAM_MAX_SOCKETS_PER_HOST, timeout: UPSTREAM_IDLE_SOCKET_MS };
+
+/** 隧道还没打通时先替它收着 TLS 握手数据；打通后接上，两边原样转发。 */
+class PendingTunnel extends Duplex {
+  constructor() {
+    super();
+    this.socket = null;
+    this.queued = [];
+    this.finalCallback = null;
+  }
+  attach(socket) {
+    if (this.destroyed) return socket.destroy();
+    this.socket = socket;
+    socket.on("data", (chunk) => {
+      if (!this.push(chunk)) socket.pause();
+    });
+    socket.once("end", () => this.push(null));
+    socket.once("error", (error) => this.destroy(error));
+    socket.once("close", () => this.destroy());
+    for (const [chunk, encoding, callback] of this.queued) socket.write(chunk, encoding, callback);
+    this.queued = [];
+    if (this.finalCallback) {
+      socket.end();
+      this.finalCallback();
+    }
+  }
+  _read() {
+    this.socket?.resume();
+  }
+  _write(chunk, encoding, callback) {
+    if (this.socket) this.socket.write(chunk, encoding, callback);
+    else this.queued.push([chunk, encoding, callback]);
+  }
+  _final(callback) {
+    if (this.socket) {
+      this.socket.end();
+      callback();
+    } else {
+      this.finalCallback = callback;
+    }
+  }
+  _destroy(error, callback) {
+    this.socket?.destroy();
+    callback(error);
+  }
+}
+
+/**
+ * 经出站代理的连接池：新连接先 CONNECT 打通隧道，再在隧道上做 TLS；建好的连接照常复用。
+ * createConnection 必须同步交出 socket，连接池才会立刻把它计入 maxSockets
+ * （回调式异步交出时，隧道打通前的并发请求每个都会再开一条）。
+ */
+class UpstreamTunnelAgent extends https.Agent {
+  createConnection(options) {
+    const host = options.hostname || options.host;
+    const authority = `${host}:${Number(options.port || 443)}`;
+    const tunnel = new PendingTunnel();
+    const connect = http.request({
+      host: UPSTREAM_PROXY.hostname,
+      port: Number(UPSTREAM_PROXY.port || 80),
+      method: "CONNECT",
+      path: authority,
+      headers: { host: authority, ...upstreamProxyAuth() },
+      agent: false,
+      timeout: 20000,
+    });
+    connect.once("connect", (response, socket, head) => {
+      if (response.statusCode !== 200) {
+        socket.destroy();
+        return tunnel.destroy(new Error(`upstream proxy CONNECT ${response.statusCode}`));
+      }
+      if (head?.length) socket.unshift(head);
+      tunnel.attach(socket);
+    });
+    connect.once("timeout", () => connect.destroy(new Error("upstream proxy timeout")));
+    connect.once("error", (error) => tunnel.destroy(error));
+    // 请求方先放弃（TLS 连接被销毁）时，没打通的 CONNECT 一并取消。
+    tunnel.once("close", () => connect.destroy());
+    connect.end();
+    return tls.connect({ socket: tunnel, servername: options.servername || host });
+  }
+}
+
+const directAgent = new https.Agent(UPSTREAM_POOL);
+const tunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent(UPSTREAM_POOL) : null;
+
+/** 发往上游网页的请求：https 走连接池，配置了出站代理时经代理隧道（本机地址一律直连）。 */
+function upstreamRequest(target, options, callback) {
+  if (target.protocol !== "https:") return http.request(options, callback);
+  const viaProxy = tunnelAgent && !isLoopbackHost(target.hostname);
+  return https.request({ ...options, agent: viaProxy ? tunnelAgent : directAgent }, callback);
+}
+
+// 模型请求经出站代理时用自己的隧道连接池，不设并发上限：并行的子任务会同时开很多条流，
+// 和网页资源共用每个主机 16 条的池子会排队。
+const gatewayTunnelAgent = UPSTREAM_PROXY ? new UpstreamTunnelAgent({ keepAlive: true }) : null;
+
+/**
+ * 发往模型网关（用户配置的上游）的请求。配置了出站代理、上游又在公网上时经代理走：
+ * 只开系统代理（没开 TUN）时直连会被上游按地区拒绝。其余情况和以前一样直连。
+ */
+function gatewayRequest(target, options, callback) {
+  if (!UPSTREAM_PROXY || isLocalNetworkHost(target.hostname)) {
+    return (target.protocol === "https:" ? https : http).request(options, callback);
+  }
+  if (target.protocol === "https:") return https.request({ ...options, agent: gatewayTunnelAgent }, callback);
+  // 明文 http 的上游：按转发代理的写法，请求行里给完整地址。
+  return http.request({
     ...options,
-    agent: undefined,
-    // ClientRequest 支持回调式 createConnection：隧道建好后再交出 TLS socket。
-    createConnection: (_options, done) => {
-      const connect = http.request({
-        host: UPSTREAM_PROXY.hostname,
-        port: Number(UPSTREAM_PROXY.port || 80),
-        method: "CONNECT",
-        path: authority,
-        headers: { host: authority, ...proxyAuth },
-        timeout: options.timeout || 20000,
-      });
-      connect.once("connect", (response, socket) => {
-        if (response.statusCode !== 200) {
-          socket.destroy();
-          return done(new Error(`upstream proxy CONNECT ${response.statusCode}`));
-        }
-        done(null, tls.connect({ socket, servername: options.hostname }));
-      });
-      connect.once("timeout", () => connect.destroy(new Error("upstream proxy timeout")));
-      connect.once("error", (error) => done(error));
-      connect.end();
-    },
+    host: UPSTREAM_PROXY.hostname,
+    hostname: UPSTREAM_PROXY.hostname,
+    port: Number(UPSTREAM_PROXY.port || 80),
+    path: target.href,
+    headers: { host: target.host, ...options.headers, ...upstreamProxyAuth() },
   }, callback);
+}
+
+function upstreamFailureHeaders(req) {
+  const result = {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "vary": "Origin",
+  };
+  const origin = req.headers.origin;
+  if (DESKTOP_WEB_ORIGINS.has(origin)) {
+    result["access-control-allow-origin"] = origin;
+    result["access-control-allow-credentials"] = "true";
+  }
+  return result;
+}
+
+/** 能原样改写的页面：200、HTML、未压缩。 */
+function isHtmlResponse(status, headers) {
+  return status === 200 && /^text\/html\b/i.test(String(headers?.["content-type"] || "")) &&
+    !headers["content-encoding"];
 }
 
 function proxyUpstream(req, res, url) {
@@ -1476,6 +2146,9 @@ function proxyUpstream(req, res, url) {
   const headers = { ...req.headers, host: url.host || target.host };
   delete headers["proxy-connection"];
   delete headers["accept-encoding"];
+  // 逐跳头只管 Claude 与本代理之间那一段；转给上游会让它每回一个请求就关连接，连接池复用不了。
+  delete headers.connection;
+  delete headers["keep-alive"];
 
   const upstreamReq = upstreamRequest(
     target,
@@ -1488,6 +2161,16 @@ function proxyUpstream(req, res, url) {
       timeout: 20000,
     },
     (up) => {
+      if (!canCache) {
+        // 边收边转：Claude Code 安装包（上百 MB）、Cowork 虚拟机镜像（GB 级）以前要整个读进内存才开始回，
+        // 下载器在这段时间收不到一个字节，空闲超时（IDLE_TIMEOUT）就放弃了。
+        res.writeHead(up.statusCode, streamedResponseHeaders(up.headers));
+        up.pipe(res);
+        res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+        up.on("close", () => { if (!up.complete) res.destroy(); });
+        return;
+      }
+      // 要缓存的只有带哈希的静态资源和页面，都不大：收齐再回，和之后从缓存回放的字节、长度一致。
       const chunks = [];
       up.on("data", (c) => chunks.push(c));
       up.on("end", () => {
@@ -1495,7 +2178,7 @@ function proxyUpstream(req, res, url) {
         const ok = up.statusCode >= 200 && up.statusCode < 400;
         // 文档路由不缓存桩体/落地页 HTML（登出页会让 SPA 卡骨架屏）
         const docStub = isDocNav(req, url) && body.length < 4096;
-        if (ok && !docStub && canCache && (!staticAsset || (
+        if (ok && !docStub && (!staticAsset || (
           up.statusCode === 200 && !up.headers["set-cookie"] &&
           !/\b(?:private|no-store)\b/i.test(String(up.headers["cache-control"] || ""))
         ))) {
@@ -1506,13 +2189,20 @@ function proxyUpstream(req, res, url) {
             JSON.stringify({ status: up.statusCode, headers: bufferedResponseHeaders(up.headers, body.length), url: cacheKey }),
           );
         }
-        res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, body.length));
-        res.end(body);
+        // 缓存里存原文，注入只改这次返回的页面。
+        const page = document && isHtmlResponse(up.statusCode, up.headers) ? addExtensions(body) : body;
+        res.writeHead(up.statusCode, bufferedResponseHeaders(up.headers, page.length));
+        res.end(page);
       });
     },
   );
   upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
   upstreamReq.on("error", (err) => {
+    if (res.headersSent) {
+      // 已经开始转发了，没法再换成兜底响应；断开让客户端知道没收全。
+      log(`UPSTREAM FAIL ${url.pathname} (mid-stream): ${err.message}`);
+      return res.destroy();
+    }
     if (serveCachedStaticAsset(req, res, url)) return;
     // 动态接口不能回放其它会话的缓存；文档仍沿用本地外壳兜底。
     if (canCache && document && fs.existsSync(cp) && fs.existsSync(metaPath)) {
@@ -1521,20 +2211,435 @@ function proxyUpstream(req, res, url) {
       const docStub = isDocNav(req, url) && (meta.status !== 200 || body.length < 4096);
       if (docStub) {
         // 桩体不落回客户端；真外壳兜底已在上层分支兜底
-        res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+        res.writeHead(502, upstreamFailureHeaders(req));
         res.end("upstream unavailable (doc stub suppressed)\n");
         return;
       }
-      res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, body.length));
-      res.end(body);
+      const page = isHtmlResponse(meta.status, meta.headers) ? addExtensions(body) : body;
+      res.writeHead(meta.status || 200, bufferedResponseHeaders(meta.headers, page.length));
+      res.end(page);
       log(`CACHE HIT ${url.pathname}`);
       return;
     }
     log(`UPSTREAM FAIL ${url.pathname}: ${err.message}`);
-    res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+    res.writeHead(502, upstreamFailureHeaders(req));
     res.end(`upstream unavailable: ${err.message}\n`);
   });
   req.pipe(upstreamReq);
+}
+
+const EMPTY_PLUGIN_DIRECTORY = { data: [], next_page: null, facets: {}, omitted: [] };
+
+// api.anthropic.com 的插件目录是公开接口（不用登录），插件页从 claude.ai 跨域读它：转给真接口。
+// 连不上或被拒时回空目录。响应必须带 CORS 头：缺了页面读不到，整页报「无法加载插件」（#25）。
+function publicPluginDirectory(req, res, url) {
+  const cors = { "access-control-allow-origin": "*" };
+  const empty = () => json(res, EMPTY_PLUGIN_DIRECTORY, 200, cors);
+  const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || `https://${url.host}`);
+  const upstreamReq = upstreamRequest(
+    target,
+    {
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: target.pathname + target.search,
+      headers: { host: url.host, accept: "application/json" },
+      timeout: 20000,
+    },
+    (up) => {
+      if (up.statusCode !== 200) {
+        up.resume();
+        return empty();
+      }
+      res.writeHead(200, { ...streamedResponseHeaders(up.headers), ...cors });
+      up.pipe(res);
+      res.on("close", () => { if (!up.complete) upstreamReq.destroy(); });
+      up.on("close", () => { if (!up.complete) res.destroy(); });
+    },
+  );
+  upstreamReq.on("timeout", () => upstreamReq.destroy(new Error("upstream timeout")));
+  upstreamReq.on("error", () => (res.headersSent ? res.destroy() : empty()));
+  upstreamReq.end();
+}
+
+/**
+ * 向一个上游地址发请求，读完整个响应体（超过 `limit` 字节放弃）。
+ * `until(正文)`：返回真时不等对方结束连接就交回，SSE 形式的回复用。
+ */
+function upstreamCall(address, { method = "GET", headers = {}, body, limit = 8 * 1024 * 1024, timeout = 30000, until } = {}) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(address);
+    const target = new URL(url.pathname + url.search, UPSTREAM_MAP[url.host] || url.origin);
+    const payload = body === undefined ? undefined : Buffer.from(body);
+    const request = upstreamRequest(
+      target,
+      {
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: target.pathname + target.search,
+        method,
+        headers: {
+          accept: "*/*", "user-agent": "claude-local", ...headers, host: url.host,
+          ...(payload ? { "content-length": payload.length } : {}),
+        },
+        timeout,
+      },
+      (response) => {
+        const chunks = [];
+        let size = 0;
+        const done = () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) });
+        response.on("data", (chunk) => {
+          size += chunk.length;
+          if (size > limit) return request.destroy(new Error("upstream response too large"));
+          chunks.push(chunk);
+          if (until?.(Buffer.concat(chunks).toString("utf8"))) {
+            done();
+            request.destroy();
+          }
+        });
+        response.on("end", done);
+        response.on("error", reject);
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error("upstream timeout")));
+    request.on("error", reject);
+    request.end(payload);
+  });
+}
+
+const fetchUpstream = (address, limit) => upstreamCall(address, { limit });
+
+const PLUGIN_DIRECTORY_URL = "https://api.anthropic.com/api/directory/plugins";
+const PLUGIN_LOOKUP_TTL_MS = 10 * 60_000;
+// 桌面端自己的上限是解压后 200 MB。
+const MAX_PLUGIN_ZIP_BYTES = 256 * 1024 * 1024;
+const pluginLookups = new Map();
+
+/** 到公开目录查一个插件：能装的返回目录记录，查不到或装不了（没有源码仓库）返回 null。目录连不上时抛错。 */
+async function directoryPlugin(key, address) {
+  const cached = pluginLookups.get(key);
+  if (cached && Date.now() - cached.at < PLUGIN_LOOKUP_TTL_MS) return cached.entry;
+  const { status, body } = await fetchUpstream(address, 4 * 1024 * 1024);
+  if (status !== 200 && status !== 404) throw new Error(`plugin directory answered ${status}`);
+  let entry = null;
+  if (status === 200) {
+    const parsed = JSON.parse(body.toString("utf8"));
+    const row = Array.isArray(parsed?.data) ? parsed.data[0] : parsed;
+    if (installablePlugin(row)) entry = row;
+  }
+  if (pluginLookups.size >= 500) pluginLookups.clear();
+  pluginLookups.set(key, { at: Date.now(), entry });
+  return entry;
+}
+
+// id 和名字都要拼进目录的地址和过滤表达式，格式不对的直接当查不到。
+function directoryPluginById(id) {
+  if (!/^plugin_\w{1,64}$/.test(id)) return null;
+  return directoryPlugin(`id:${id}`, `${PLUGIN_DIRECTORY_URL}/${id}`);
+}
+
+function directoryPluginByName(name) {
+  if (!/^[\w.-]{1,128}$/.test(name)) return null;
+  const filter = `manifest_name == '${name}' && source.marketplace_slug == '${DIRECTORY_MARKETPLACE.name}'`;
+  return directoryPlugin(`name:${name}`, `${PLUGIN_DIRECTORY_URL}?limit=1&filter=${encodeURIComponent(filter)}`);
+}
+
+const connectorService = createConnectorService({
+  connectors: CONNECTORS,
+  send: upstreamCall,
+  changed: () => stateStore.flush(),
+  redirectUri: () => `http://127.0.0.1:${listeningPort}${CONNECTOR_SIGN_IN_PATH}`,
+});
+
+/**
+ * 账号侧的连接器接口（见 connectors.mjs）：添加 / 列出 / 移除、连接和登录、状态事件流、会话里的工具调用。
+ * 处理了返回 true。
+ */
+function connectorApi(req, res, url, p) {
+  const method = req.method;
+  const fail = (error) => {
+    if (res.headersSent) return res.destroy();
+    const known = error instanceof ConnectorError;
+    json(res, {
+      type: "error",
+      error: {
+        type: known ? "invalid_request_error" : "api_error",
+        message: known ? error.message : "Connector request failed",
+        details: { error_code: known ? error.code : "mcp_request_failed" },
+      },
+    }, known ? error.status : 502);
+  };
+  const answer = (work) => {
+    Promise.resolve().then(work).then((value) => { if (value !== undefined) json(res, value); }).catch(fail);
+    return true;
+  };
+  const withBody = (work) => {
+    readBody(req, (raw) => answer(() => work(decodeJsonBody(req, raw))));
+    return true;
+  };
+
+  // 页面拿登录结果（不带组织）。
+  if (method === "GET" && p === "/api/mcp/auth_callback") {
+    return answer(() => connectorService.claim(url.searchParams.get("state") ?? "", url.searchParams.get("ticket") ?? ""));
+  }
+  const route = /^\/api\/organizations\/[^/]+\/mcp\/(.+)$/.exec(p)?.[1];
+  if (!route) return false;
+
+  if (method === "GET" && route === "v2/bootstrap") {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store" });
+    const write = (event, data) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
+    connectorService.stream(write).catch(() => {}).finally(() => res.end());
+    return true;
+  }
+  if (method === "GET" && route === "remote_servers_with_connection") {
+    return answer(() => connectorService.list().map((connector) => ({
+      ...connectorRecord(connector),
+      connection_state: connector.disconnected ? "user_disconnected" : connectorService.connected(connector) ? "connected" : null,
+      connection_auth_type: null,
+    })));
+  }
+  if (route === "remote_servers") {
+    if (method === "GET") return answer(() => connectorService.list().map(connectorRecord));
+    if (method === "POST") {
+      return withBody((body) => {
+        const { connector, existing } = connectorService.create({
+          name: body.name, url: body.url, directoryUuid: body.mcp_directory_server_uuid ?? body.install?.mcp_directory_server_uuid,
+        });
+        return { ...connectorRecord(connector), ...(existing ? { existing: true } : {}) };
+      });
+    }
+    return false;
+  }
+  if (method === "POST" && route === "desktop_finish/wait_ended") return answer(() => ({}));
+  // 连接表单（要用户填地址或密钥的连接器）没有数据来源；404 时页面直接走普通的添加。
+  if (method === "GET" && /^directory_servers\/[^/]+\/install_form$/.test(route)) {
+    return answer(() => { throw new ConnectorError("not_found", "No install form", 404); });
+  }
+
+  const target = /^(remote_servers|logout|start-auth|servers)\/([0-9a-f-]{36})(?:\/(.+))?$/.exec(route);
+  if (!target) return false;
+  const [, kind, uuid, rest] = target;
+  const connector = connectorService.get(uuid);
+  if (!connector) {
+    return answer(() => { throw new ConnectorError("mcp_connector_removed", "This connector was removed.", 404); });
+  }
+
+  if (kind === "remote_servers" && rest === undefined) {
+    if (method === "GET") return answer(() => connectorRecord(connector));
+    if (method === "PUT") {
+      return withBody((body) => {
+        connectorService.rename(connector, body.name);
+        return connectorRecord(connector);
+      });
+    }
+    if (method === "DELETE") {
+      return answer(() => {
+        connectorService.remove(uuid);
+        return {};
+      });
+    }
+    return false;
+  }
+  if (kind === "remote_servers" && method === "POST" && rest === "clear_cache") {
+    return answer(() => {
+      connectorService.refreshStatus(connector);
+      return {};
+    });
+  }
+  // 逐个工具的权限设置：本地不做，空对象在页面里是「没有清单」。
+  if (kind === "remote_servers" && method === "GET" && rest === "tools") return answer(() => ({}));
+  if (kind === "logout" && method === "POST" && rest === undefined) {
+    return answer(() => {
+      connectorService.logout(connector);
+      return {};
+    });
+  }
+  if (kind === "start-auth" && method === "GET" && rest === undefined) {
+    return answer(() => {
+      // 不带 response_format=json 的是整页跳转式登录，目的地在真正的 claude.ai 上，本地接不住。
+      if (url.searchParams.get("response_format") !== "json") {
+        throw new ConnectorError("mcp_sign_in_unavailable", "This sign-in route is not available locally.");
+      }
+      return connectorService.startAuth(connector, url.searchParams.get("desktop_finish") ?? "");
+    });
+  }
+  if (kind === "servers" && method === "POST" && rest === "tools/call") {
+    return withBody((body) => connectorService.callTool(connector, String(body.tool_name ?? ""), body.arguments));
+  }
+  if (kind === "servers" && method === "GET" && rest === "resources/list") return answer(() => ({ resources: [] }));
+  if (kind === "servers" && method === "POST" && rest === "resources/read") return answer(() => ({ contents: [] }));
+  return false;
+}
+
+const CONNECTOR_SIGN_IN_PATH = "/mcp-oauth-callback";
+
+/** 浏览器登录完跳回来的本机页面：换好令牌后把人送回 Claude。 */
+function connectorSignInCallback(res, url) {
+  const page = (status, title, detail, link) => {
+    const escape = (text) => String(text).replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char]);
+    const body = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+      `<title>${escape(title)}</title>` +
+      (link ? `<meta http-equiv="refresh" content="0;url=${escape(link)}">` : "") +
+      `<body style="font: 16px system-ui; max-width: 28rem; margin: 20vh auto; padding: 0 1rem; text-align: center">` +
+      `<h1 style="font-size: 1.25rem">${escape(title)}</h1><p>${escape(detail)}</p>` +
+      (link ? `<p><a href="${escape(link)}">${escape(runtime.localization ? "回到 Claude" : "Back to Claude")}</a></p>` : "");
+    res.writeHead(status, {
+      "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(body),
+      "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+    });
+    res.end(body);
+  };
+  const zh = runtime.localization;
+  connectorService.finishAuth({
+    state: url.searchParams.get("state") ?? "", code: url.searchParams.get("code"), error: url.searchParams.get("error"),
+  }).then((result) => {
+    if (!result) {
+      return page(400, zh ? "登录已失效" : "Sign-in expired", zh ? "请回到 Claude，重新点一次「连接」。" : "Go back to Claude and choose Connect again.");
+    }
+    if (result.success) {
+      return page(200, zh ? `已登录 ${result.name}` : `Signed in to ${result.name}`, zh ? "正在回到 Claude…" : "Returning to Claude…", result.link);
+    }
+    page(200, zh ? `没能登录 ${result.name}` : `Could not sign in to ${result.name}`, zh ? "正在回到 Claude…" : "Returning to Claude…", result.link);
+  }).catch(() => page(502, zh ? "登录出错" : "Sign-in failed", zh ? "请回到 Claude 再试一次。" : "Go back to Claude and try again."));
+}
+
+/**
+ * 账号侧的插件接口（详情、已装列表、启用状态、安装包）。处理了返回 true。
+ *
+ * 安装的过程：网页 PUT `plugins/<id>/enabled`，然后让桌面端同步；桌面端读「已启用的插件」列表，
+ * 对本地没有的逐个 GET `plugins/<id>/download` 取 zip 解压，之后的 Cowork / Code 会话里就有这个插件。
+ * 卸载是 PUT enabled=false，桌面端删掉本地那份。
+ */
+function pluginApi(req, res, url, p) {
+  const route = /^\/api\/organizations\/[^/]+\/(.+)$/.exec(p)?.[1];
+  if (!route) return false;
+  const method = req.method;
+  const notFound = () => json(res, { error: { details: { error_code: "plugin_not_found" } } }, 404);
+  const answer = (work) => {
+    work().catch(() => {
+      if (res.headersSent) return res.destroy();
+      json(res, { type: "error", error: { type: "api_error", message: "Plugin directory unavailable" } }, 502);
+    });
+    return true;
+  };
+  const installed = () => [...INSTALLED_PLUGINS.values()];
+
+  if (method === "GET" && route === "marketplaces/list-default-marketplaces") {
+    json(res, { marketplaces: [DIRECTORY_MARKETPLACE] });
+    return true;
+  }
+  // 市场自己的插件清单：浏览用的是公开目录，这里不重复列。
+  if (method === "GET" && /^marketplaces\/[^/]+\/plugins\/(?:account-)?list-plugins$/.test(route)) {
+    json(res, { plugins: [], has_more: false });
+    return true;
+  }
+  if (method === "GET" && route === "plugins/list-plugins") {
+    // 桌面端分三种查：组织强制安装的、账号启用的（enabled_only）、可浏览的。只有第二种有内容。
+    const enabledOnly = url.searchParams.get("enabled_only") === "true";
+    json(res, { plugins: enabledOnly ? installed().map((entry) => pluginRecord(entry, true)) : [], has_more: false });
+    return true;
+  }
+  // 「您的插件」：只接按种类查插件的那种读法，其余（skill、分组）留给通用的空列表。
+  if (method === "GET" && route === "library/mine" && url.searchParams.get("kind") === "plugin" &&
+      !url.searchParams.has("group_by_kind")) {
+    json(res, { items: installed().map(libraryItem), next_cursor: null });
+    return true;
+  }
+  // 组织目录：合并式插件页的「您的插件」、搜索、连接器详情页（按 id 查）都读它。
+  if (method === "GET" && route === "directory/plugins") {
+    const filter = url.searchParams.get("filter") ?? "";
+    const wanted = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    // 「您的插件」：状态为已启用 / 已停用的记录，搜索时再按名字筛。
+    if (/^\(?installation\.state in \[/.test(filter)) {
+      const matches = (entry) => !wanted ||
+        [entry.name, entry.slug, entry.summary, entry.publisher?.name].some((text) => String(text ?? "").toLowerCase().includes(wanted));
+      json(res, { ...EMPTY_PLUGIN_DIRECTORY, data: installed().filter(matches).map(installedDirectoryRecord) });
+      return true;
+    }
+    // 其余的查询里只接搜索和按 id 查，原样问公开目录；别的（首页各栏）页面自己会读公开目录，这里留空。
+    if (!wanted && !/^id in \[/.test(filter)) return false;
+    return answer(async () => {
+      // 公开目录不认登录后才有的 include（installation.*），带着会被 400 拒绝。
+      const query = new URLSearchParams(url.searchParams);
+      const include = (query.get("include") ?? "").split(",").filter((part) => part && !part.startsWith("installation"));
+      if (include.length) query.set("include", include.join(","));
+      else query.delete("include");
+      const { status, body } = await fetchUpstream(`${PLUGIN_DIRECTORY_URL}?${query}`, 4 * 1024 * 1024);
+      const page = status === 200 ? JSON.parse(body.toString("utf8")) : EMPTY_PLUGIN_DIRECTORY;
+      // 公开目录里每条都是「未登录」：已装的换成已启用（查询要求没装的时去掉），其余换成未安装。
+      const rows = (Array.isArray(page.data) ? page.data : [])
+        .filter((row) => !(filter.startsWith("!(installation.state in [") && INSTALLED_PLUGINS.has(row?.id)));
+      json(res, {
+        ...page,
+        data: rows.map((row) => (INSTALLED_PLUGINS.has(row?.id) ? installedDirectoryRecord(row) : {
+          ...row,
+          installation: { state: "not_installed", actions: { install: true }, admin_policy: { type: "set", install_mode: "optional" } },
+        })),
+      });
+    });
+  }
+  if (method === "GET" && route === "plugins/enabled-state") {
+    json(res, {
+      preferences: installed().map((entry) => ({
+        plugin_name: entry.manifest_name,
+        marketplace_id: DIRECTORY_MARKETPLACE.id,
+        marketplace_name: DIRECTORY_MARKETPLACE.name,
+        enabled: true,
+      })),
+    });
+    return true;
+  }
+
+  const byName = /^plugins\/by-name\/([^/]+)$/.exec(route);
+  if (method === "GET" && byName) {
+    return answer(async () => {
+      let name = "";
+      try { name = decodeURIComponent(byName[1]); } catch {}
+      const marketplace = url.searchParams.get("marketplace_name");
+      const entry = marketplace && marketplace !== DIRECTORY_MARKETPLACE.name
+        ? null
+        : installed().find((plugin) => plugin.manifest_name === name) ?? await directoryPluginByName(name);
+      if (!entry) return notFound();
+      json(res, pluginRecord(entry, INSTALLED_PLUGINS.has(entry.id)));
+    });
+  }
+
+  const plugin = /^plugins\/([^/]+)(?:\/(scan-status|versions|download|enabled))?$/.exec(route);
+  if (!plugin || plugin[1] === "registry") return false;
+  const [, id, action] = plugin;
+
+  if (method === "PUT" && action === "enabled") {
+    readBody(req, (raw) => answer(async () => {
+      const enabled = decodeJsonBody(req, raw).enabled !== false;
+      // 启用时重新查一次目录：重装就能拿到新审核的提交。目录连不上时沿用已装的那份。
+      const entry = (enabled ? await Promise.resolve(directoryPluginById(id)).catch(() => null) : null)
+        ?? INSTALLED_PLUGINS.get(id) ?? await directoryPluginById(id);
+      if (!entry) return notFound();
+      if (enabled) INSTALLED_PLUGINS.set(id, entry);
+      else INSTALLED_PLUGINS.delete(id);
+      stateStore.flush();
+      json(res, pluginRecord(entry, enabled));
+    }));
+    return true;
+  }
+  if (method !== "GET") return false;
+  if (action === "versions") {
+    // 版本历史没有数据来源；404 在前端表示「不支持」，页面照常显示。
+    notFound();
+    return true;
+  }
+  return answer(async () => {
+    const entry = INSTALLED_PLUGINS.get(id) ?? await directoryPluginById(id);
+    if (!entry) return notFound();
+    if (action === "scan-status") return json(res, { content_scan: null });
+    if (action !== "download") return json(res, pluginRecord(entry, INSTALLED_PLUGINS.has(id)));
+    const { owner, repo, commit, dir } = pluginRepository(entry);
+    const source = await fetchUpstream(`https://codeload.github.com/${owner}/${repo}/zip/${commit}`, MAX_PLUGIN_ZIP_BYTES);
+    if (source.status !== 200) throw new Error(`plugin source answered ${source.status}`);
+    // 桌面端解压时会去掉唯一的最外层目录，整个仓库就是插件时原样给。
+    const zip = dir ? zipSubtree(source.body, dir) : source.body;
+    res.writeHead(200, { "content-type": "application/zip", "content-length": zip.length, "cache-control": "no-store" });
+    res.end(zip);
+  });
 }
 
 // ── 请求处理 ─────────────────────────────────────────────────
@@ -1554,6 +2659,34 @@ function handle(req, res, hostHeader) {
     return mockApi(req, res, url);
   }
   if (runtime.managed && isMainClaudeHost && url.pathname.startsWith("/__codex_plus/")) {
+    if (pageApi && url.pathname.startsWith(PAGE_API_PREFIX)) return pageApi.handle(req, res, url.pathname);
+    // 运行时脚本里带着调用令牌：只给页面自己的同源请求，别的站点用 <script> 引不走。
+    const planScript = pagePlan && ["GET", "HEAD"].includes(req.method) && req.headers["sec-fetch-site"] === "same-origin" &&
+      (url.pathname === PAGE_RUNTIME_PATH || url.pathname.startsWith(PAGE_PACKAGE_PREFIX))
+      ? pagePlan.script(url.pathname, PAGE_TOKEN)
+      : null;
+    if (planScript !== null) {
+      const body = Buffer.from(planScript);
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "content-length": body.length,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      return res.end(req.method === "HEAD" ? undefined : body);
+    }
+    const asset = extensions && ["GET", "HEAD"].includes(req.method) && url.pathname.startsWith(EXTENSION_PREFIX)
+      ? extensions.read(url.pathname.slice(EXTENSION_PREFIX.length))
+      : null;
+    if (asset) {
+      res.writeHead(200, {
+        "content-type": asset.type,
+        "content-length": asset.body.length,
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      return res.end(req.method === "HEAD" ? undefined : asset.body);
+    }
     if (
       url.pathname !== LOCALIZATION_SHIM_PATH ||
       !localizationShim ||
@@ -1597,7 +2730,8 @@ function handle(req, res, hostHeader) {
   }
 
   const officialResourcePath = (() => {
-    if (!dataManaged || !["GET", "HEAD"].includes(req.method)) return null;
+    // 外壳用本机版本时，它引用的静态资源也从本机资源包出（见 useOfficialShell）。
+    if (!useOfficialShell || !["GET", "HEAD"].includes(req.method)) return null;
     const mapI18nPath = (pathname) => {
       const match = pathname.match(/^\/i18n\/(?:(s|dynamic)\/)?([a-zA-Z-]+)\.json$/);
       if (!match) return pathname;
@@ -1652,21 +2786,22 @@ function handle(req, res, hostHeader) {
     }
   }
 
-  // Fresh受管profile直接使用安装包内同一版本的官方SPA和静态资源，不依赖旧HTML录制缓存。
+  // 受管 profile 直接使用安装包内同一版本的官方SPA和静态资源，不依赖旧HTML录制缓存（见 useOfficialShell）。
   if (
-    dataManaged &&
+    useOfficialShell &&
     MODE === "mock" &&
     isMainClaudeHost &&
     req.method === "GET" &&
     !path.extname(url.pathname) &&
     !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
   ) {
+    const shell = addExtensions(officialShell);
     res.writeHead(200, {
       "content-type": "text/html; charset=utf-8",
-      "content-length": Buffer.byteLength(officialShell),
+      "content-length": Buffer.byteLength(shell),
       "cache-control": "no-cache",
     });
-    return res.end(officialShell);
+    return res.end(shell);
   }
 
   if (
@@ -1754,9 +2889,18 @@ function handle(req, res, hostHeader) {
           organization: { uuid: ORG.uuid, name: ORG.name },
         });
       }
+      if (req.method === "GET" && url.pathname === "/api/directory/plugins") {
+        return publicPluginDirectory(req, res, url);
+      }
+      if (/^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(url.pathname)) {
+        return json(res, EMPTY_PLUGIN_DIRECTORY);
+      }
+      if (/\/dxt\/(?:extensions|installable_extensions)$/.test(url.pathname)) {
+        return json(res, { entries: [], total: 0 });
+      }
       // 远端托管策略：本地空放行（不挡插件/连接器）。
       // CLI 比 Desktop 校验更严格，settings 响应必须包含 uuid/checksum/settings。
-      // policy_limits → {restrictions:[],compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
+      // policy_limits → {restrictions:{},compliance_taints:[],defaults:{}}（BymwSUZ2 校验器）
       if (/^\/api\/claude_code\/settings/.test(url.pathname)) {
         const body = JSON.stringify({ uuid: ORG.uuid, settings: {}, content: { entries: {} }, checksum: "local-1" });
         res.writeHead(200, {
@@ -1768,7 +2912,7 @@ function handle(req, res, hostHeader) {
         return res.end(body);
       }
       if (/^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-        return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+        return json(res, POLICY_LIMITS);
       }
       // token 计数：网关不一定实现，本地估算
       if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
@@ -1819,7 +2963,7 @@ function handle(req, res, hostHeader) {
     return res.end(body);
   }
   if (MODE !== "passthrough" && /^\/api\/claude_code\/policy_limits/.test(url.pathname)) {
-    return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, POLICY_LIMITS);
   }
   if (MODE !== "passthrough" && /^\/api\/claude_cli\/bootstrap/.test(url.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
@@ -1836,6 +2980,22 @@ function handle(req, res, hostHeader) {
   if (MODE === "mock" && ["/", "/login", "/app-unavailable-in-region"].includes(url.pathname)) {
     res.writeHead(302, { location: "/new", "content-length": 0 });
     return res.end();
+  }
+  // 不看 Accept：Claude 加载主界面 /epitaxy 时不带 text/html，按 isDocNav 判断会漏掉、落到线上兜底。
+  if (
+    MODE === "mock" && TEMPLATE_SHELL && isMainClaudeHost &&
+    req.method === "GET" &&
+    !path.extname(url.pathname) &&
+    !/^\/(?:api|edge-api|v1|claudeai-rpc)(?:\/|$)/.test(url.pathname)
+  ) {
+    const shell = addExtensions(TEMPLATE_SHELL);
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": shell.length,
+      "cache-control": "no-store",
+      ...(url.pathname === "/new" ? { "set-cookie": activeOrgCookies() } : {}),
+    });
+    return res.end(shell);
   }
   if (MODE === "mock" && url.pathname === "/new") {
     const key = crypto.createHash("sha1").update("claude.ai/login").digest("hex");
@@ -1889,9 +3049,10 @@ function handle(req, res, hostHeader) {
     const docNav = isDocNav(req, url);
     if (fs.existsSync(cp) && fs.existsSync(`${cp}.json`)) {
       const meta = JSON.parse(fs.readFileSync(`${cp}.json`, "utf8"));
-      const body = fs.readFileSync(cp);
+      const cached = fs.readFileSync(cp);
       // 文档导航只允许真外壳通过；桩体/重定向（登出落地页）改走外壳兜底
-      if (!docNav || (meta.status === 200 && body.length >= 4096)) {
+      if (!docNav || (meta.status === 200 && cached.length >= 4096)) {
+        const body = docNav && !meta.headers?.["content-encoding"] ? addExtensions(cached) : cached;
         res.writeHead(meta.status && meta.status < 400 ? 200 : meta.status, {
           ...meta.headers,
           "content-length": body.length,
@@ -1957,9 +3118,7 @@ function dictationLanguage(requestUrl) {
 function readDictationReceipt() {
   const receiptPath = path.join(APP_STATE_DIR, "dictation-helper.json");
   try {
-    const metadata = fs.lstatSync(receiptPath);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) return null;
-    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) return null;
+    if (!isPrivateFile(fs.lstatSync(receiptPath))) return null;
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     if (
       !Number.isInteger(receipt.port) || receipt.port < 1 || receipt.port > 65535 ||
@@ -2012,7 +3171,7 @@ function handleDictationUpgrade(req, clientSocket, head) {
       origin.pathname !== "/" ||
       origin.search ||
       origin.hash ||
-      !DICTATION_ALLOWED_ORIGINS.has(origin.origin)
+      !DESKTOP_WEB_ORIGINS.has(origin.origin)
     ) {
       return rejectUpgrade(clientSocket, "403 Forbidden", "forbidden");
     }
@@ -2138,6 +3297,8 @@ inner.on("upgrade", handleDictationUpgrade);
 // 剥掉桌面端多发、上游网关不认的字段后转给本地 magpie。
 const outer = http.createServer((req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+  // 连接器登录的回调是浏览器直接打开的，带不了本地凭据：凭的是登录开始时发出去的随机 state。
+  if (req.method === "GET" && u.pathname === CONNECTOR_SIGN_IN_PATH) return connectorSignInCallback(res, u);
   if (runtime.managed && req.headers.origin !== undefined) return json(res, { error: "Browser origins are not allowed" }, 403);
   if (req.method === "GET" && u.pathname === "/__codex_claude_local/health") return json(res, health());
   if (runtime.managed) {
@@ -2160,8 +3321,14 @@ const outer = http.createServer((req, res) => {
   if (/^\/api\/claude_cli\/bootstrap/.test(u.pathname)) {
     return json(res, { client_data: {}, settings: {}, config: {}, enabled: true, environments: [], sessions: [], plugins: [], items: [], data: [] });
   }
+  if (u.pathname === "/api/directory/plugins" || /^\/api\/organizations\/[^/]+\/directory\/plugins$/.test(u.pathname)) {
+    return json(res, EMPTY_PLUGIN_DIRECTORY);
+  }
+  if (/\/dxt\/(?:extensions|installable_extensions)$/.test(u.pathname)) {
+    return json(res, { entries: [], total: 0 });
+  }
   if (/^\/api\/claude_code\/policy_limits/.test(u.pathname)) {
-    return json(res, { restrictions: [], compliance_taints: [], defaults: {}, artifact_create_notice: null });
+    return json(res, POLICY_LIMITS);
   }
   if (/^\/api\/claude_code\//.test(u.pathname)) {
     const body = JSON.stringify({ uuid: ORG.uuid, settings: {}, content: { entries: {} }, checksum: "local-1" });
@@ -2179,6 +3346,79 @@ const MITM_HOSTS = runtime.managed
   ? /(^|\.)(claude\.ai|claude\.com|anthropic\.com)$/i
   : /(^|\.)(claude\.ai|claude\.com|anthropic\.com|ccbobi\.com)$/i;
 
+const PASS_THROUGH_CONNECT_TIMEOUT_MS = 15_000;
+
+// 非 claude 域名的 TCP 隧道。Claude 被 --proxy-server 指到本代理后，这些域名（统计、错误上报、
+// 第三方 CDN 等）也都经过这里：
+// - Claude 一侧关闭（含 RST）或任一侧出错：两侧立即一起关。只看上游出错会把上游连接一直留着。
+// - 上游正常关闭：交给 pipe 把剩余数据写完再关 Claude 一侧，不截断。
+// - 连不上的目标限时放弃；Claude 先放弃时同时取消还没连上的连接，不在后台继续连。
+// - 配了出站代理时经它 CONNECT：系统代理对 Claude 已失效，直连在受限网络里连不上，越积越多。
+function passThrough(clientSocket, host, port, head) {
+  let upstream = null;
+  let pending = null;
+  let open = false;
+  let done = false;
+  const teardown = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    pending?.destroy();
+    upstream?.destroy();
+    clientSocket.destroy();
+  };
+  const timer = setTimeout(teardown, PASS_THROUGH_CONNECT_TIMEOUT_MS);
+  clientSocket.once("close", teardown);
+  // CONNECT 交过来的 socket 没人读，Claude 断开时这里收不到 FIN/RST。隧道建好前先读着：
+  // 早到的数据暂存，建好后补发；Claude 在这期间关掉就立刻取消。
+  const early = [];
+  const onEarlyData = (chunk) => early.push(chunk);
+  const onEarlyEnd = () => teardown();
+  clientSocket.on("data", onEarlyData);
+  clientSocket.once("end", onEarlyEnd);
+  const attach = (socket) => {
+    upstream = socket;
+    socket.on("error", teardown);
+    socket.once("close", (hadError) => {
+      if (hadError || !open) teardown();
+    });
+  };
+  const established = (upstreamHead) => {
+    if (done) return;
+    open = true;
+    clearTimeout(timer);
+    clientSocket.off("data", onEarlyData);
+    clientSocket.off("end", onEarlyEnd);
+    clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    if (upstreamHead?.length) clientSocket.write(upstreamHead);
+    if (head?.length) upstream.write(head);
+    for (const chunk of early) upstream.write(chunk);
+    upstream.pipe(clientSocket);
+    clientSocket.pipe(upstream);
+  };
+
+  if (UPSTREAM_PROXY && !isLoopbackHost(host)) {
+    const authority = `${host}:${port}`;
+    pending = http.request({
+      host: UPSTREAM_PROXY.hostname,
+      port: Number(UPSTREAM_PROXY.port || 80),
+      method: "CONNECT",
+      path: authority,
+      headers: { host: authority, ...upstreamProxyAuth() },
+    });
+    pending.once("connect", (response, socket, upstreamHead) => {
+      pending = null;
+      attach(socket);
+      if (response.statusCode !== 200) return teardown();
+      established(upstreamHead);
+    });
+    pending.once("error", teardown);
+    pending.end();
+    return;
+  }
+  attach(net.connect(Number(port), host, () => established()));
+}
+
 outer.on("connect", (req, clientSocket, head) => {
   noteClient();
   clientSocket.on("error", () => {});
@@ -2186,14 +3426,7 @@ outer.on("connect", (req, clientSocket, head) => {
   // 非 claude 域名：TCP 直通，不终止 TLS（保证 CDN / 其他服务不受影响）
   if (!MITM_HOSTS.test(host)) {
     log(`PASS-THROUGH CONNECT ${host}:${port}`);
-    const upstream = net.connect(Number(port), host, () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head?.length) upstream.write(head);
-      upstream.pipe(clientSocket);
-      clientSocket.pipe(upstream);
-    });
-    upstream.on("error", () => clientSocket.destroy());
-    return;
+    return passThrough(clientSocket, host, port, head);
   }
   clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
   const tlsSocket = new tls.TLSSocket(clientSocket, {
@@ -2223,6 +3456,7 @@ function shutdown() {
   stopping = true;
   clearTimeout(readyWriteTimer);
   stateStore.flush();
+  backendHost?.stopAll();
   outer.close(() => process.exit(0));
   for (const socket of clientSockets) socket.destroy();
   setTimeout(() => process.exit(0), 1000).unref();

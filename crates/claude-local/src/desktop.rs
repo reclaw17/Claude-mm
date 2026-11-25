@@ -95,10 +95,33 @@ pub fn source_app(deadline: Instant) -> Result<PathBuf> {
         program.join(r"Claude\Claude.exe"),
     ];
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) { return Ok(path); }
+    // 官网 exe（Squirrel）装在 %LOCALAPPDATA%\AnthropicClaude\app-<版本>\（#46）。
+    if let Some(path) = squirrel_app(&local.join("AnthropicClaude")) { return Ok(path); }
     // 查询失败不是「未安装」，明确返回错误，避免把超时误报成未安装。
     let output = query?;
     ensure!(output.status.success(), "无法检测 Claude 安装位置，请检查 Windows 应用包服务后重试");
     Ok(local.join(r"Programs\Claude\Claude.exe"))
+}
+
+/// Squirrel 安装（官网 exe）：根目录下的 `claude.exe` 只是启动器，真正的应用在 `app-<版本>\claude.exe`，
+/// `resources\` 就在它旁边。自更新后会并存多个 `app-*`，取版本号最大的那个。
+#[cfg(any(target_os = "windows", test))]
+fn squirrel_app(root: &Path) -> Option<PathBuf> {
+    fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let version = name.get(..4).filter(|prefix| prefix.eq_ignore_ascii_case("app-"))
+                .map(|_| &name[4..])?
+                .split('.')
+                .map(|part| part.parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            let exe = entry.path().join("claude.exe");
+            exe.is_file().then_some((version, exe))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, exe)| exe)
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -168,7 +191,7 @@ pub fn source_app(_deadline: Instant) -> Result<PathBuf> {
 }
 
 fn home_dir() -> PathBuf {
-    directories::BaseDirs::new()
+    crate::user_dirs::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_default()
 }
@@ -198,6 +221,25 @@ pub fn app_version(_app: &Path, _key: &str, _deadline: Instant) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn squirrel_install_picks_newest_app_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("AnthropicClaude");
+        assert_eq!(squirrel_app(&root), None, "没装");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("claude.exe"), b"launcher").unwrap();
+        assert_eq!(squirrel_app(&root), None, "只有启动器不算");
+        for dir in ["app-6.9.0", "app-6.28899.6", "app-6.28899.10", "app-6.30000.0", "app-beta", "packages"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        // app-6.30000.0 没有 claude.exe（更新到一半），跳过。
+        for dir in ["app-6.9.0", "app-6.28899.6", "app-6.28899.10", "app-beta"] {
+            fs::write(root.join(dir).join("claude.exe"), b"app").unwrap();
+        }
+        // 按版本号逐段比较，不按字符串（6.28899.10 > 6.28899.6 > 6.9.0）。
+        assert_eq!(squirrel_app(&root), Some(root.join("app-6.28899.10").join("claude.exe")));
+    }
 
     #[test]
     fn claude_msix_namespace_discovery_and_classification_agree() {

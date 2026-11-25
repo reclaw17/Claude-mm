@@ -23,6 +23,8 @@ sha2.workspace = true
 time = "0.3"
 url = "2"
 uuid.workspace = true
+# 导入页面扩展包（.zip）。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 futures-util = { workspace = true, optional = true }
 http = { version = "1", optional = true }
 reqwest = { workspace = true, optional = true }
@@ -30,16 +32,24 @@ sherpa-onnx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["io-util", "net", "sync"] }
 tokio-tungstenite = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Networking_WinHttp",
   "Win32_Storage_FileSystem",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Security",
   "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
   "Win32_System_Threading",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]
+# 测试程序在 main 之前进家目录沙箱（claude_local::test_sandbox），不碰用户的真实目录。
+ctor = "0.8"
 tempfile.workspace = true

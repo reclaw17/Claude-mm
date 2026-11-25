@@ -1,0 +1,37 @@
+{
+  "host": "claudeDesktop",
+  "apiVersion": 1,
+  "api": [
+    "version", "apiVersion", "host", "supports", "constants", "script",
+    "extension", "plugin", "services", "currentSessionId", "currentSession", "builtins",
+    "toast", "call", "ask", "onCleanup", "fail",
+    "registerPage", "registerNavEntry", "registerFloatingTab", "registerShortcut", "registerTheme",
+    "registerMenuItem", "registerSettingsPanel", "registerSettingsSection",
+    "registerCommand", "registerComposerAction", "registerInputTrigger",
+    "registerMessageAction", "registerMessageDecoration", "registerToolView",
+    "registerRowAction", "registerSlot", "registerSidePanel"
+  ],
+  "ctx": [
+    "id", "scriptKey", "manifest", "instance", "config", "onConfigUpdate", "backend", "llm", "themes", "disposed",
+    "storage", "locale", "asset", "provide", "get", "inject", "effect",
+    "registerRowAction", "registerNavEntry", "registerMenuItem", "registerPage", "registerCommand", "registerComposerAction",
+    "registerMessageAction", "registerMessageDecoration", "registerSlot", "registerFloatingTab", "registerSettingsPanel",
+    "registerToolView", "registerSettingsSection", "registerInputTrigger", "registerShortcut", "registerTheme", "registerSidePanel",
+    "currentSessionId", "ask", "on", "emit", "intercept", "waterfall", "listen", "setTimeout", "setInterval", "onScan",
+    "call", "toast", "fail", "dispose"
+  ],
+  "constants": [
+    "pageClass", "pageNavAttribute", "railSelector", "railDestinationSelector", "actionGroupClass", "moreMenuClass", "toastClass", "extensionAttribute"
+  ],
+  "sharedConstants": {
+    "pageClass": "codex-plus-page-overlay",
+    "pageNavAttribute": "data-codex-plus-page-nav",
+    "actionGroupClass": "codex-session-actions",
+    "moreMenuClass": "codex-session-more-menu",
+    "toastClass": "codex-delete-toast",
+    "extensionAttribute": "data-codex-plus-ext"
+  },
+  "newInClaude": ["host", "supports"],
+  "rejectUnsupported": ["llm.complete", "llm.listModels"],
+  "routes": ["/diagnostics/log", "/backend/status"]
+}

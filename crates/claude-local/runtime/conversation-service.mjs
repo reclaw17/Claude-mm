@@ -10,7 +10,8 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import { gatewayModel, gatewayTarget, runtimeConfig } from "./runtime.mjs";
+import { createGatewayStreamParser, gatewayHttpError, gatewayModel, gatewayTarget, opencodeSessionHeaders, runtimeConfig } from "./runtime.mjs";
+import { withProjectContext } from "./projects.mjs";
 import {
   decode, get, asStr, asMsg, asInt, ld, vi,
   requestMessages, frame, endFrame,
@@ -24,21 +25,26 @@ import {
 
 const runtime = runtimeConfig();
 
+function defaultGatewayRequest(target, options, callback) {
+  return (target.protocol === "https:" ? https : http).request(options, callback);
+}
+
 /**
  * 调网关拿一轮回复的文本增量。
  * 返回 {next} 迭代器：{done:false,value:string} / {done:true}，出错 throw。
  */
-function anthropicStream(messages, model, signal) {
+function anthropicStream(messages, model, signal, request = defaultGatewayRequest, sessionId, context = null) {
   const queue = [];
   let notify = null;
   let done = false, failed = null;
   const push = (v) => { queue.push(v); const n = notify; notify = null; n?.(); };
-  const payload = JSON.stringify({
+  const fail = (e) => { failed ??= e; done = true; const n = notify; notify = null; n?.(); };
+  const payload = JSON.stringify(withProjectContext({
     model: gatewayModel(runtime, model), max_tokens: 4096, stream: true, messages,
-  });
+  }, context));
   const u = gatewayTarget(runtime, "/v1/messages");
-  const lib = u.protocol === "https:" ? https : http;
-  const req = lib.request(
+  const req = request(
+    u,
     {
       hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80),
       path: u.pathname + u.search,
@@ -49,39 +55,30 @@ function anthropicStream(messages, model, signal) {
         authorization: `Bearer ${runtime.key}`,
         "anthropic-version": "2023-06-01",
         accept: "text/event-stream",
+        ...opencodeSessionHeaders(u, () => sessionId),
       },
     },
     (res) => {
-      if (res.statusCode >= 400) {
-        res.resume();
-        res.on("end", () => {
-          failed = new Error(`gateway HTTP ${res.statusCode}`);
-          done = true; const n = notify; notify = null; n?.();
-        });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        const chunks = [];
+        let size = 0;
+        res.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
+        res.on("end", () => fail(new Error(gatewayHttpError(res.statusCode, Buffer.concat(chunks)))));
+        res.on("error", fail);
         return;
       }
-      let buf = "";
-      res.on("data", (c) => {
-        buf += c.toString("utf8");
-        let i;
-        while ((i = buf.indexOf("\n\n")) >= 0) {
-          const ev = buf.slice(0, i); buf = buf.slice(i + 2);
-          const line = ev.split("\n").find((l) => l.startsWith("data:"));
-          if (!line) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          let d; try { d = JSON.parse(data); } catch { continue; }
-          if (d.type === "content_block_delta" && d.delta?.type === "text_delta") push(d.delta.text);
-          else if (d.type === "message_stop") push({ end: true });
-          else if (d.type === "error") failed = new Error("gateway stream error");
-        }
+      const parser = createGatewayStreamParser({
+        text: push,
+        stop: () => push({ end: true }),
+        error: (message) => fail(new Error(message)),
       });
-      res.on("end", () => { done = true; const n = notify; notify = null; n?.(); });
-      res.on("error", (e) => { failed = e; done = true; const n = notify; notify = null; n?.(); });
+      res.on("data", (c) => parser.write(c));
+      res.on("end", () => { parser.end(); done = true; const n = notify; notify = null; n?.(); });
+      res.on("error", fail);
     },
   );
-  req.on("timeout", () => req.destroy(new Error("gateway timeout")));
-  req.on("error", (e) => { failed = e; done = true; const n = notify; notify = null; n?.(); });
+  req.on("timeout", () => req.destroy(new Error("上游超时：5 分钟没有响应")));
+  req.on("error", fail);
   if (signal) signal.addEventListener("abort", () => { try { req.destroy(); } catch {} });
   req.end(payload);
   return {
@@ -102,8 +99,8 @@ function anthropicStream(messages, model, signal) {
   };
 }
 
-async function* gatewayDeltas(messages, model, signal) {
-  const it = anthropicStream(messages, model, signal);
+async function* gatewayDeltas(messages, model, signal, request = defaultGatewayRequest, sessionId, context = null) {
+  const it = anthropicStream(messages, model, signal, request, sessionId, context);
   for (;;) {
     const r = await it.next();
     if (r.done) return;
@@ -113,8 +110,12 @@ async function* gatewayDeltas(messages, model, signal) {
 
 // ── 服务 ─────────────────────────────────────────────────────
 // deps: ensureConv(id) -> conv；listConvs() -> conv[]；log(...)
-// conv 约定字段：uuid/name/created_at/updated_at/turns[]/nextIndex/leafMessageId
-export function createConversationService({ ensureConv, listConvs, log, onChange = () => {} }) {
+// projectContext(conv) -> 项目要带给模型的上下文或 null；hasProject(uuid) -> 项目是否存在（见 projects.mjs）
+// conv 约定字段：uuid/name/created_at/updated_at/turns[]/nextIndex/leafMessageId/project_uuid
+export function createConversationService({
+  ensureConv, listConvs, log, onChange = () => {}, request = defaultGatewayRequest,
+  projectContext = () => null, hasProject = () => false,
+}) {
   /** convId -> {res, convId, frames, closed, hb} */
   const streams = new Map();
 
@@ -172,6 +173,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
           leaf,
           created: conv.created_at ? new Date(conv.created_at) : undefined,
           updated: conv.updated_at ? new Date(conv.updated_at) : undefined,
+          projectId: conv.project_uuid,
         })
       : undefined;
     const live = conv.turns.find((t) => !t.complete);
@@ -190,6 +192,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
       leaf: c.leafMessageId || undefined,
       created: c.created_at ? new Date(c.created_at) : undefined,
       updated: c.updated_at ? new Date(c.updated_at) : undefined,
+      projectId: c.project_uuid,
     });
   }
 
@@ -216,7 +219,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
           if (previous === turn) break;
           if (previous.text) messages.push({ role: "assistant", content: previous.text });
         }
-        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal)) {
+        for await (const delta of gatewayDeltas(messages, turn.model, controller.signal, request, conv.uuid, projectContext(conv))) {
           if (turn.complete) break;
           turn.text += delta;
           onChange();
@@ -236,10 +239,11 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
         conv: conversation({
           id: conv.uuid,
           model: conv.model,
-          title: conv.name !== "New conversation" ? conv.name : undefined,
+          title: conv.name && conv.name !== "New conversation" ? conv.name : undefined,
           status: 1, leaf: turn.asstId,
           created: conv.created_at ? new Date(conv.created_at) : undefined,
           updated: new Date(conv.updated_at),
+          projectId: conv.project_uuid,
         }),
         messages: [message({
           id: turn.asstId, convId: conv.uuid, role: "assistant", index: turn.asstIndex,
@@ -297,6 +301,8 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
     conv.turns.push(turn);
     conv.leafMessageId = turn.asstId;
     conv.model = turn.model;
+    // 在项目里开的对话：第一条消息带着项目 id。
+    if (!conv.project_uuid && hasProject(send.projectId)) conv.project_uuid = send.projectId;
     if (!conv.name || conv.name === "New conversation") conv.name = titleFromPrompt(send.text);
     conv.updated_at = now.toISOString();
     onChange(true);
@@ -316,6 +322,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
       parentMessageId: asStr(get(sm, 5)),
       inputMode: asInt(get(sm, 6)),
       model: asStr(get(asMsg(get(sm, 7)), 2)),
+      projectId: asStr(get(sm, 9)),
     };
   };
 
@@ -427,6 +434,7 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
             text: asStr(get(sm, 3)) ?? "",
             parentMessageId: asStr(get(sm, 5)),
             model: asStr(get(asMsg(get(sm, 7)), 2)),
+            projectId: asStr(get(sm, 9)),
           });
           await ensureReply(conv);
           const ack = mutationAck({ sessionId: header.sessionId, version: header.version, applied: true });
@@ -451,8 +459,12 @@ export function createConversationService({ ensureConv, listConvs, log, onChange
         return unary(res, readHistoryResponse(conv ? buildStateUpdate(conv) : conversationUpdate({})));
       }
 
-      case "ListConversations":
-        return unary(res, listConversationsResponse(listConvs().map(convProto)));
+      case "ListConversations": {
+        // ListConversationsRequest{older_cursor=1, limit=2, starred=3, project_id=4}
+        const projectId = asStr(get(reqMsg, 4));
+        const convs = projectId ? listConvs().filter((c) => c.project_uuid === projectId) : listConvs();
+        return unary(res, listConversationsResponse(convs.map(convProto)));
+      }
 
       case "StreamConversationList": {
         res.writeHead(200, streamHeaders);

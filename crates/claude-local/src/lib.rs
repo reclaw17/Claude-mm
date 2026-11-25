@@ -6,12 +6,16 @@
 mod backend;
 pub mod cli_import;
 pub mod desktop;
+pub mod extensions;
 pub mod fsutil;
 mod host;
 pub mod node;
 pub mod session_sync;
 pub mod settings;
 pub mod sysproxy;
+#[doc(hidden)]
+pub mod test_sandbox;
+pub mod user_dirs;
 #[cfg(windows)]
 pub mod winproc;
 
@@ -19,9 +23,9 @@ pub mod winproc;
 pub mod dictation;
 
 pub use backend::{
-    ClaudeLocalResult, ClaudeLocalStatus, configure, friendly_model_name, inherited_context_tokens,
-    launch_claude, perform, pick_context_tokens, private_dir, reap_stale_proxy, resume_attached_proxy,
-    status, stop_backend,
+    ClaudeLocalResult, ClaudeLocalStatus, TemplateVersion, configure, desktop_process_listing, friendly_model_name,
+    inherited_context_tokens, launch_claude, perform, pick_context_tokens, private_dir, reap_stale_proxy,
+    resume_attached_proxy, shutdown_on_exit, status, stop_backend,
 };
 pub use host::{Host, Upstream, install_host};
 pub use settings::ClaudeLocalSettings;
@@ -29,3 +33,10 @@ pub use settings::ClaudeLocalSettings;
 /// Windows 上启动子进程不弹控制台窗口。
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// 测试不许碰用户的真实目录：main 之前进家目录沙箱（见 `claude_local::test_sandbox`）。
+#[cfg(test)]
+#[ctor::ctor]
+fn enter_test_sandbox() {
+    test_sandbox::enter();
+}

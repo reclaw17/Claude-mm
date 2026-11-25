@@ -223,6 +223,68 @@ function normalizeMember(pathname) {
   return member;
 }
 
+const COWORK_PROMPT_ANCHOR = Buffer.from("`<application_details>\\nClaude is operating as an agent inside the Claude desktop app.");
+const MAX_APP_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_PROMPT_BYTES = 256 * 1024;
+const TEMPLATE_ESCAPES = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", "\\": "\\", "`": "`", "$": "$", "\n": "", "\r": "", "\r\n": "" };
+
+function decodePromptLiteral(source) {
+  const parts = [];
+  let position = 0;
+  for (const match of source.matchAll(/`|\$\{|\\(?:u\{([\da-fA-F]{1,6})\}|u([\da-fA-F]{4})|x([\da-fA-F]{2})|\r\n|[\s\S])/g)) {
+    parts.push(source.slice(position, match.index));
+    const [token, braced, fixed, byte] = match;
+    if (token === "`") return parts.join("").trim();
+    if (token === "${") return "";
+    const hex = braced ?? fixed ?? byte;
+    if (hex) {
+      parts.push(String.fromCodePoint(parseInt(hex, 16)));
+    } else {
+      const escaped = token.slice(1);
+      if (!Object.hasOwn(TEMPLATE_ESCAPES, escaped)) return "";
+      parts.push(TEMPLATE_ESCAPES[escaped]);
+    }
+    position = match.index + token.length;
+  }
+  return "";
+}
+
+/**
+ * 官方桌面端在原生 3P bootstrap 里通过 system_prompts.cowork_system_prompt 下发 Cowork
+ * 的系统提示词。这里从本机 app.asar 里读出同一份文本，避免在开源仓库里重新分发官方文本。
+ * 找不到时返回空串，由调用方决定如何兜底。
+ */
+export function loadCoworkSystemPrompt(resourcesDir, overrideFile) {
+  if (overrideFile) {
+    try {
+      const prompt = readUnpackedFile(overrideFile, MAX_PROMPT_BYTES).toString("utf8").trim();
+      if (prompt) return prompt;
+    } catch {}
+  }
+  if (!resourcesDir) return "";
+  try {
+    const archivePath = path.join(fs.realpathSync(resourcesDir), "app.asar");
+    const metadata = fs.lstatSync(archivePath);
+    if (!metadata.isFile() || metadata.size > MAX_APP_ARCHIVE_BYTES) return "";
+    const descriptor = fs.openSync(archivePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile() || stat.size !== metadata.size || stat.dev !== metadata.dev || stat.ino !== metadata.ino) return "";
+      const chunkSize = 1024 * 1024;
+      for (let start = 0; start + COWORK_PROMPT_ANCHOR.length <= stat.size; start += chunkSize - COWORK_PROMPT_ANCHOR.length + 1) {
+        const buffer = readExactly(descriptor, Math.min(chunkSize, stat.size - start), start);
+        const anchor = buffer.indexOf(COWORK_PROMPT_ANCHOR);
+        if (anchor < 0) continue;
+        const position = start + anchor + 1;
+        return decodePromptLiteral(readExactly(descriptor, Math.min(MAX_PROMPT_BYTES, stat.size - position), position).toString("utf8"));
+      }
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  } catch {}
+  return "";
+}
+
 export function createOfficialAssets(resourcesDir) {
   if (!resourcesDir) return null;
   const archive = openArchive(resourcesDir);

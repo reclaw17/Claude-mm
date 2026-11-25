@@ -3,6 +3,7 @@
 mod commands;
 mod host;
 mod log;
+mod market;
 mod upstreams;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             install_tray(app)?;
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
@@ -61,6 +63,15 @@ pub fn run() {
             commands::claude_local_status,
             commands::claude_local_configure,
             commands::claude_local_action,
+            commands::claude_local_extensions,
+            commands::claude_local_extension_enable,
+            commands::claude_local_extension_import,
+            commands::claude_local_extension_remove,
+            commands::claude_local_extension_config,
+            commands::claude_local_extension_open_folder,
+            commands::claude_local_extension_market,
+            commands::claude_local_extension_install,
+            commands::claude_local_extension_open_page,
             commands::claude_mom_load,
             commands::claude_mom_save_profile,
             commands::claude_mom_delete_profile,
@@ -87,7 +98,7 @@ pub fn run() {
             }
         }
         tauri::RunEvent::Exit => {
-            claude_local::stop_backend();
+            claude_local::shutdown_on_exit();
             claude_local::dictation::server::remove_receipt();
             log::append("app.exit", serde_json::json!({}));
         }
@@ -141,4 +152,11 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+/// 测试不许碰用户的真实目录：main 之前进家目录沙箱（见 `claude_local::test_sandbox`）。
+#[cfg(test)]
+#[ctor::ctor]
+fn enter_test_sandbox() {
+    claude_local::test_sandbox::enter();
 }

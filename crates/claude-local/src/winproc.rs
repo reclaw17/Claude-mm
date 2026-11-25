@@ -2,6 +2,7 @@
 //! 与 Codex++ 的 windows_integration 同一实现（只取本库用到的部分）。
 #![allow(clippy::all)]
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
@@ -10,6 +11,9 @@ use anyhow::Context;
 use windows::Win32::Foundation::{BOOL, CloseHandle, FILETIME, HANDLE, HWND, LPARAM, MAX_PATH, WPARAM};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::RemoteDesktop::{
+    WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTSEnumerateProcessesW, WTSFreeMemory,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -72,6 +76,37 @@ pub struct WindowsProcessInfo {
     pub parent_process_id: u32,
     pub exe_file: String,
     pub executable_path: Option<PathBuf>,
+    /// 进程所在的 Windows 会话（同一台电脑上每个登录的用户各一个）；查不到时为 `None`。
+    pub session_id: Option<u32>,
+}
+
+/// 本进程所在的 Windows 会话。
+#[cfg(windows)]
+pub fn current_session_id() -> Option<u32> {
+    let mut session = 0u32;
+    // SAFETY: 输出参数指向栈上的 u32；ProcessIdToSessionId 见文件下方的 kernel32 声明。
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut session) }
+        .as_bool()
+        .then_some(session)
+}
+
+/// 全机进程 → 会话。`WTSEnumerateProcessesW` 不用打开进程，其它用户的进程（没有权限打开的）也查得到。
+#[cfg(windows)]
+fn process_sessions() -> HashMap<u32, u32> {
+    let mut sessions = HashMap::new();
+    let mut info: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
+    let mut count = 0u32;
+    // SAFETY: 成功时 info 指向 count 个 WTS_PROCESS_INFOW，用完由 WTSFreeMemory 释放。
+    let listed = unsafe { WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut info, &mut count) };
+    if listed.is_err() || info.is_null() {
+        return sessions;
+    }
+    let entries = unsafe { std::slice::from_raw_parts(info, count as usize) };
+    for entry in entries {
+        sessions.insert(entry.ProcessId, entry.SessionId);
+    }
+    unsafe { WTSFreeMemory(info.cast()) };
+    sessions
 }
 
 
@@ -92,6 +127,7 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
     if unsafe { Process32FirstW(snapshot, &mut entry) }.is_err() {
         return Vec::new();
     }
+    let sessions = process_sessions();
     loop {
         let process_id = entry.th32ProcessID;
         processes.push(WindowsProcessInfo {
@@ -99,6 +135,7 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
             parent_process_id: entry.th32ParentProcessID,
             exe_file: nul_terminated_wide_to_string(&entry.szExeFile),
             executable_path: query_process_image_path(process_id),
+            session_id: sessions.get(&process_id).copied(),
         });
         if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
             break;
@@ -570,4 +607,79 @@ impl Drop for HandleGuard {
     fn drop(&mut self) {
         let _ = unsafe { CloseHandle(self.0) };
     }
+}
+
+#[cfg(windows)]
+fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"')) {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat('\\').take(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    out.extend(std::iter::repeat('\\').take(backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+pub fn run_elevated_certutil(args: &[&str], timeout: std::time::Duration) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    use windows::Win32::UI::Shell::{SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::PCWSTR;
+
+    fn wide_null(value: impl AsRef<OsStr>) -> Vec<u16> {
+        value.as_ref().encode_wide().chain(once(0)).collect()
+    }
+
+    let params = args
+        .iter()
+        .map(|arg| quote_win_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb = wide_null("runas");
+    let file = wide_null("certutil.exe");
+    let parameters = wide_null(&params);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }
+        .context("未能拉起管理员授权窗口来安装或移除本机根证书")?;
+    if info.hProcess.is_invalid() {
+        anyhow::bail!("系统未返回 certutil 进程句柄");
+    }
+    let _guard = HandleGuard(info.hProcess);
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let wait = unsafe { WaitForSingleObject(info.hProcess, millis) };
+    anyhow::ensure!(wait == WAIT_OBJECT_0, "等待本机证书授权超时");
+    let mut exit_code = 1u32;
+    unsafe { GetExitCodeProcess(info.hProcess, &mut exit_code) }
+        .context("无法读取 certutil 退出状态")?;
+    anyhow::ensure!(exit_code == 0, "certutil 退出码 {exit_code}");
+    Ok(())
 }

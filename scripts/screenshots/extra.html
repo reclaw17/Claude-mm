@@ -1,0 +1,9 @@
+<style>
+  /* Inactive macOS window buttons, measured on the upstream screenshot: 14px circles, centres at x 15.5 / 38.5 / 61.5, y 15.5. */
+  #shot-lights { position: fixed; top: 8.5px; left: 8.5px; display: flex; gap: 9px; z-index: 2147483647; pointer-events: none; }
+  #shot-lights i { display: block; width: 14px; height: 14px; border-radius: 50%; border: 0.5px solid rgba(200, 200, 200, 0.6); background: linear-gradient(#454342, #3b3938); }
+  /* Russian labels are wider than the Chinese ones: give the upstream list 24px more so "Добавить" and
+     "Импорт" with its chevron fit into the two footer buttons. Stand-in only, the real UI is not localized. */
+  html[data-shot-lang="ru"] { --cm-sublist-width: 232px; }
+  html[data-shot-lang="ru"] .cm-sublist-foot .cm-btn { padding: 0 7px; }
+</style>

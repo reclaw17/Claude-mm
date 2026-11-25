@@ -1,0 +1,69 @@
+{
+  "claude_mom_load": {
+    "status": "ok",
+    "message": "",
+    "activeId": "magpie",
+    "profiles": [
+      {
+        "id": "magpie",
+        "name": "Magpie",
+        "baseUrl": "http://127.0.0.1:3425",
+        "apiKey": "magpie",
+        "model": "DeepSeek-V4.1-Flash",
+        "smallModel": "",
+        "models": ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Pro", "DeepSeek-R1"],
+        "contextWindow": 128000,
+        "modelNames": {
+          "DeepSeek-V4.1-Flash": "DeepSeek-V4.1-Flash · DeepSeek",
+          "DeepSeek-V4.1-Pro": "DeepSeek-V4.1-Pro · DeepSeek",
+          "DeepSeek-R1": "DeepSeek-R1 · DeepSeek"
+        },
+        "source": "magpie",
+        "sourceId": ""
+      }
+    ]
+  },
+  "claude_local_status": {
+    "status": "ok",
+    "message": "",
+    "supported": true,
+    "sourceApp": "/Applications/Claude.app",
+    "version": "6.28899.6",
+    "claudeRunning": false,
+    "running": false,
+    "connected": false,
+    "port": null,
+    "caReady": true,
+    "caTrusted": true,
+    "caMachineSupported": true,
+    "caMachineTrusted": false,
+    "templates": [],
+    "nodeAvailable": true,
+    "dictationReady": false,
+    "config": {
+      "enabled": true,
+      "model": "DeepSeek-V4.1-Flash",
+      "localization": true,
+      "voiceInput": false,
+      "computerUse": true,
+      "backgroundMode": true,
+      "forceBackgroundMode": false,
+      "cowork": true,
+      "hubHome": true,
+      "template": "",
+      "threePMode": false,
+      "displayName": "Local User",
+      "email": "local@claude.local",
+      "plan": "ultra",
+      "sessionSync": false,
+      "listAllModels": false,
+      "hideUnroutedModels": true,
+      "codeShareHome": true,
+      "importCliSessions": true
+    },
+    "models": ["DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Pro", "DeepSeek-R1"],
+    "contextWindow": 128000,
+    "warning": null,
+    "needsRestart": false
+  }
+}
